@@ -48,8 +48,11 @@ python setup_comfyenv.py --checkpoint-dir ..\..\models\TTS\drama-3 --download   
    in full precision. If that fails, your setup can't run Drama 3 — and you have not downloaded
    41.5 GB to find out.
 2. **The second** downloads the checkpoint at the pinned revision (it resumes if interrupted).
-   You can also download the files yourself — `codec.pth`, the eight `model-0000N-of-00008.safetensors`
-   and the small `*.json` files, from the pinned revision — and rerun the first command.
+   Or download the nine large files yourself — with a download manager, say — from
+   `https://huggingface.co/fishaudio/drama-3/resolve/dd64a85cd82e9521f7202610ede97b367fc83946/<file>`
+   (`codec.pth` and `model-00001-of-00008.safetensors` … `model-00008-of-00008.safetensors`) into the
+   checkpoint folder, then run `python setup_comfyenv.py --checkpoint-dir <folder> --verify`: it
+   fetches the small files and checks every file against Hugging Face's hashes.
 3. **Restart ComfyUI.** The nodes are under **audio → Drama 3**.
 
 ## Quick start: clone a voice and direct it
@@ -138,7 +141,8 @@ more VRAM keeps more of them resident.
 ## Troubleshooting
 
 - **"Drama 3 is not set up"** — run `setup_comfyenv.py` (see Install).
-- **"Free other GPU workloads"** — the job needs about 11 GB free on the GPU. Close other GPU apps.
+- **"Free other GPU workloads"** — the job needs about 14 GB of free VRAM with `keep_loaded` (the codec
+  stays loaded beside the model), about 10.5 GB without. Close other GPU apps.
 - **Slow, or the PC swaps** — the model pins about 28 GB of RAM; close heavy apps (browsers, editors).
 - **A take keeps going** — set `max_frames`, and stop the run from ComfyUI; the process is killed.
 - **Check the install** — `python setup_comfyenv.py` reruns the self-check at any time.
