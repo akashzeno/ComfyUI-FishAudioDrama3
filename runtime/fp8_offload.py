@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
-from safetensors import safe_open
 from tokenizers import Tokenizer
 
 from fish_speech.models.text2semantic.fish_omni.backbone import (
@@ -399,6 +398,8 @@ def load_backbone_direct(backbone, checkpoint_dir, threads=8):
                 slot = (slot_name, expert, part)
                 direct = getattr(backbone.get_submodule(prefix), 'packed', None) is not None
             dtype = SAFETENSORS_DTYPES.get(info['dtype'])
+            if dtype is None:
+                raise ValueError(f"{key}: unsupported checkpoint dtype {info['dtype']}")
             if tuple(info['shape']) != tuple(destination.shape):
                 raise ValueError(f"{key}: checkpoint shape {info['shape']} != model shape {tuple(destination.shape)}")
             if (direct and dtype != destination.dtype) or (destination.dtype == torch.float8_e4m3fn and dtype != destination.dtype):
@@ -407,18 +408,21 @@ def load_backbone_direct(backbone, checkpoint_dir, threads=8):
                 raise ValueError(f'{slot} appears twice in the checkpoint')
             filled.add(slot)
             start, end = info['data_offsets']
-            tasks.append((base + start, end - start, key, destination, direct))
+            tasks.append((base + start, end - start, key, destination, direct, dtype))
     if missing := _expected_slots(targets) - filled:
         raise ValueError(f'{len(missing)} backbone tensors are not in the checkpoint, e.g. {sorted(missing)[:4]}')
 
+    # Plain reads, no memory mapping: eight shards mapped at once beside 30 GB of pinned RAM made
+    # Windows fail a load with "insufficient system resources" (error 1450).
     def read(shard, tasks):
-        with torch.inference_mode(), open(checkpoint_dir / shard, 'rb', buffering=0) as raw, \
-                safe_open(str(checkpoint_dir / shard), framework='pt', device='cpu') as tensors:
-            for offset, size, key, destination, direct in sorted(tasks, key=lambda task: task[0]):
-                if not direct:
-                    destination.copy_(tensors.get_tensor(key))
-                    continue
-                view = memoryview(destination.view(torch.uint8).numpy()).cast('B')
+        with torch.inference_mode(), open(checkpoint_dir / shard, 'rb', buffering=0) as raw:
+            for offset, size, key, destination, direct, dtype in sorted(tasks, key=lambda task: task[0]):
+                # packed experts land in their pinned rows; anything else in a CPU buffer, copied
+                # (and converted, as Fish's loader does) into its parameter
+                target = destination if direct else torch.empty(destination.shape, dtype=dtype)
+                view = memoryview(target.reshape(-1).view(torch.uint8).numpy()).cast('B')
+                if len(view) != size:
+                    raise ValueError(f'{key}: {size} bytes in the file, {len(view)} expected')
                 raw.seek(offset)
                 done = 0
                 while done < size:
@@ -426,6 +430,8 @@ def load_backbone_direct(backbone, checkpoint_dir, threads=8):
                     if not count:
                         raise ValueError(f'{shard} ends inside {key}')
                     done += count
+                if not direct:
+                    destination.copy_(target)
 
     with ThreadPoolExecutor(max(1, min(threads, len(plan)))) as pool:
         for future in [pool.submit(read, shard, tasks) for shard, tasks in plan.items()]:

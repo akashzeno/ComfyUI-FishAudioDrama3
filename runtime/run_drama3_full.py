@@ -363,7 +363,9 @@ def run_job(job, output, budget, state=None):
         'part_speakers': [speaker for chunk in chunks for speaker, _ in parse_speaker_segments(chunk)],
         'streaming': streaming, 'text': job['text']}
     if not state:
-        del model
+        # The CUDA graphs hold the model (and their own memory): drop both, or the 12 GB stays on the
+        # GPU beside the codec and decoding spills into shared memory, taking minutes instead of seconds.
+        del model, graphs
         gc.collect()
         torch.cuda.empty_cache()
     emit(stage='Saving audio and reusable takes', progress=.96)

@@ -241,7 +241,9 @@ the 40 CPU stops. Already measured, so don't redo them without new information:
 - **Loading.** `load_backbone_direct` plans every checkpoint tensor (slot, shape, dtype) from the
   safetensors headers before reading anything, then reads packed experts with `readinto` straight
   into pinned rows, one thread per shard; threads must re-enter `torch.inference_mode()` to write
-  inference tensors. Measured: model 62 s → 20 s, worker ready 93 s → 45 s; disk reads about
+  inference tensors. Plain reads only: memory-mapping all eight shards at once (safetensors'
+  `safe_open`) beside 30 GB of pinned RAM once failed with Windows error 1450, "insufficient system
+  resources". Measured: model 62 s → 20 s, worker ready 93 s → 45 s; disk reads about
   2 GiB/s per file.
 - **Pinned RAM.** Pageable expert memory gets trimmed under memory pressure, and copies then crawl
   at about 1 GB/s on page faults. Pinned RAM copies at about 13 GB/s.
@@ -255,6 +257,9 @@ the 40 CPU stops. Already measured, so don't redo them without new information:
     because the allocator keeps each stream's freed blocks for that stream alone.
 - **CPU reads.** `ExpertStagingPool.stage` reads the router on the CPU, so it runs between graphs,
   never inside one.
+- **Freeing the model.** The CUDA graphs reference the model and own memory pools. With
+  `keep_loaded` off, the job must drop the graphs too before reloading the codec, or 12 GB stays on
+  the GPU and decoding spills into shared memory (measured: about 100 s instead of 6 s).
 - **Attention cache.** The graphs hold the attention-cache addresses. If eager generation grows the
   caches, the graphs must not be replayed: `DecodeGraphs.fits` checks this.
 - **Padded length.** A longer padded attention length doesn't change the numerics, because masked
