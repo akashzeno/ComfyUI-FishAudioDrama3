@@ -19,6 +19,7 @@ from comfy_api.latest import io
 from server import PromptServer
 from .take_io import load_take, save_take
 from .runtime_paths import resolve_launch
+from .log_echo import LogEcho
 
 NODE_DIR = Path(__file__).resolve().parent
 CONFIG = NODE_DIR / 'runtime.json'
@@ -159,6 +160,12 @@ class Drama3FP8Speech:
                             event.update(audio=name, type='temp', subfolder='')
                         notify(event)
 
+            def to_terminal(text):
+                sys.stdout.write(text)
+                sys.stdout.flush()
+
+            echo = LogEcho(log_path, to_terminal)
+            print(f'[Drama 3] job started ({launch["mode"]} mode, {variations} take(s), GPU budget {budget:.1f} GB)', flush=True)
             with log_path.open('w', encoding='utf-8') as log:
                 process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, creationflags=flags, cwd=str(runtime),
                                            env=os.environ | launch['env'])
@@ -166,8 +173,11 @@ class Drama3FP8Speech:
                     while process.poll() is None:
                         model_management.throw_exception_if_processing_interrupted()
                         read_events()
+                        echo.pump()
                         time.sleep(.25)
                     read_events()
+                    echo.pump()
+                    print(f'\n[Drama 3] job finished (exit code {process.returncode})', flush=True)
                 except BaseException:
                     if os.name == 'nt':
                         subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], stdout=subprocess.DEVNULL,
