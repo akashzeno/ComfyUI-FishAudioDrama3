@@ -66,7 +66,7 @@ The pack started from [Nebuluss/Drama-3](https://github.com/Nebuluss/Drama-3) (g
 | `log_echo.py` | Echoes the job log (with the frame counter) to ComfyUI's terminal |
 | `setup_comfyenv.py` | Setup: fetches Fish Speech at the pinned commit, applies the patch, records the weights folder. `--download` gets the weights; `--verify` hash-checks weights downloaded some other way |
 | `runtime/run_drama3_full.py` | The job runner, run as a child process. Builds prompts, chunks text, encodes references (with a cache), generates and decodes. `--serve` turns it into the persistent worker |
-| `runtime/fp8_offload.py` | Loads the model with its experts in pinned RAM, packed one row per expert (`packed_layout`, `packed_views`). `ExpertCache` is the per-layer GPU cache (packed rows, least recently used evicted first); `ExpertStagingPool.place` puts a step's experts in it, `prefetch` copies guessed ones ahead on a side stream, `stage` serves the eager path and prefill |
+| `runtime/fp8_offload.py` | Loads the model with its experts in pinned RAM, packed one row per expert (`packed_layout`, `packed_views`). `ExpertCache` is the per-layer GPU cache (packed rows, least recently used evicted first); `ExpertStagingPool.place` puts a step's experts in it, `prefetch` copies guessed ones ahead on a side stream, `stage` serves the eager path and prefill. `load_backbone_direct` reads the checkpoint with packed experts straight into pinned rows |
 | `runtime/drama3_generate.py` | Fast mode: `TowerGraphs` (the audio decoder), `BackboneGraphs` (the backbone in pieces between expert fetches), `DecodeGraphs`, `PromptState` (the prompt read once per job), and `generate_drama3_graphed` |
 | `runtime/selfcheck.py` | Checks Fish's FP8 kernels on this GPU against full-precision maths |
 | `runtime/streaming.patch` | The only change to Fish Speech: a frame callback for progress and preview |
@@ -102,6 +102,7 @@ python tests\test_speaker_dialogue.py
 python tests\test_expert_cache.py
 python tests\test_backbone_graphs.py   # needs an FP8 GPU (SM 8.9+)
 python tests\test_prompt_reuse.py      # needs an FP8 GPU (SM 8.9+)
+python tests\test_fast_load.py         # the direct-load part needs CUDA (pinned memory)
 ```
 
 Run every test file before you commit. They are plain `unittest` files, one process each.
@@ -188,6 +189,10 @@ the 40 CPU stops. Already measured, so don't redo them without new information:
   took 38 s.
 - *Pinned host buffers for the router's picks* made no measurable difference on their own; the
   CPU stop is not dominated by that copy.
+- *Between backbone steps* (plain timers, no profiler): the audio decoder's step is 7.4 ms of GPU
+  work and all the bookkeeping 0.29 ms of a 59 ms frame. Nothing to gain there.
+- *Prefetching the router's runner-ups* (ranks 9–16) during the audio decoder's step, when PCIe is
+  idle: at most 0.5% faster in simulation on 1,947 recorded frames — most are already cached.
 
 - *Eviction rules.* Replaying 1,947 recorded frames: least-recently-used hits 47.8% at 20 slots
   per layer, a decaying frequency count 48.7%, uneven slots per layer 48.0%; the unreachable
@@ -228,8 +233,16 @@ the 40 CPU stops. Already measured, so don't redo them without new information:
   codes are equally accurate but not identical. The worker caches each reference's first encode, so
   it matches a fresh process. A warm-up encode was tried and dropped: its codes made a test seed
   run away.
-- **Codec masks.** The codec builds three 32,768² attention masks that its modules never read. They
-  are dropped at load, which takes the codec from 4.6 GB to 1.6 GB of VRAM.
+- **Codec masks.** The codec's transformers build 32,768² attention masks that they never read
+  (they always pass their own). `unused_codec_masks_skipped` makes `torch.tril` return a
+  placeholder for exactly that call while the codec is built (15 s of the codec's 22 s of loading),
+  and `load_codec_slim` drops them; VRAM 4.6 GB → 1.6 GB. A transformer that is not window-limited
+  would need its mask, so loading refuses one that got a placeholder.
+- **Loading.** `load_backbone_direct` plans every checkpoint tensor (slot, shape, dtype) from the
+  safetensors headers before reading anything, then reads packed experts with `readinto` straight
+  into pinned rows, one thread per shard; threads must re-enter `torch.inference_mode()` to write
+  inference tensors. Measured: model 62 s → 20 s, worker ready 93 s → 45 s; disk reads about
+  2 GiB/s per file.
 - **Pinned RAM.** Pageable expert memory gets trimmed under memory pressure, and copies then crawl
   at about 1 GB/s on page faults. Pinned RAM copies at about 13 GB/s.
   - Pinning swaps copies, so it needs about 1 GB of headroom per layer while it happens.

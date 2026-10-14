@@ -96,7 +96,7 @@ class Drama3FP8Speech:
             'use_history': ('BOOLEAN', {'default': True, 'tooltip': 'Use previous audio as context. Disable to retain its reference voices but start fresh.'}),
             'variations': ('INT', {'default': 1, 'min': 1, 'max': 64, 'tooltip': 'Seeds increment across takes. Model is loaded once per job.'}),
             'streaming': ('BOOLEAN', {'default': False, 'tooltip': 'Decode and preview during generation. Uses more RAM offloading and may run slower.'}),
-            'keep_loaded': ('BOOLEAN', {'default': True, 'tooltip': 'Keep the model loaded between runs (saves about 1.5 min per run). It is unloaded after idle_unload_minutes, or as soon as ComfyUI loads another model onto the GPU.'}),
+            'keep_loaded': ('BOOLEAN', {'default': True, 'tooltip': 'Keep the model loaded between runs (saves about 45 s per run). It is unloaded after idle_unload_minutes, or as soon as ComfyUI loads another model onto the GPU.'}),
             'idle_unload_minutes': ('INT', {'default': 10, 'min': 1, 'max': 240, 'tooltip': 'Unload the kept model after this many minutes without a run.'}),
             'fast_mode': ('BOOLEAN', {'default': True, 'tooltip': 'Replay each decoding step from CUDA graphs and read the prompt in larger chunks: about 6x faster. Takes repeat exactly, but differ slightly from takes made with this off; off reproduces the original integration bit for bit.'}),
         }, 'hidden': {'unique_id': 'UNIQUE_ID'}}
@@ -206,7 +206,7 @@ class Drama3FP8Speech:
 
             if persistent:
                 if not reuse:
-                    notify({'stage': 'Starting the Drama 3 worker: loading the model once (about 1.5 min)', 'progress': .02})
+                    notify({'stage': 'Starting the Drama 3 worker: loading the model once (about 45 s)', 'progress': .02})
                     print(f'[Drama 3] starting the worker (GPU budget {budget:.1f} GB, unloads after '
                           f'{idle_unload_minutes} idle minutes)', flush=True)
                     WORKER.start(key, [python, '-u', runner], runtime, os.environ | launch['env'], budget, idle_unload_minutes * 60)

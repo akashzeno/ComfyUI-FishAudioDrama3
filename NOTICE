@@ -26,6 +26,7 @@ run_drama3_full.py); in fast mode each decode step is replayed from CUDA graphs 
 Speech's own graph code path — the audio decoder, and the backbone in pieces between expert
 fetches — the prompt is read in larger chunks, the state a prompt's prefill leaves is reused by
 later takes of the same prompt, and the next layer's experts are guessed with its own router and
-copied ahead; streamed experts are packed one row per expert (runtime/drama3_generate.py,
-runtime/fp8_offload.py, run_drama3_full.py). The Fish Audio Materials
+copied ahead; streamed experts are packed one row per expert and read from the checkpoint files
+straight into pinned memory, and the codec is built without its unused attention masks
+(runtime/drama3_generate.py, runtime/fp8_offload.py, run_drama3_full.py). The Fish Audio Materials
 themselves are not modified beyond upstream's runtime/streaming.patch.

@@ -1,5 +1,6 @@
 """Full local Drama 3 job runtime; models are reused across chunks and variations."""
 import argparse
+import contextlib
 import gc
 import hashlib
 import json
@@ -164,17 +165,45 @@ FAST_PREFILL_ROWS = 512
 CODEC_RESERVE_GIB = 3.0  # codec beside the model: 1.6 GB of weights + up to 0.95 GB while encoding
 
 
+CODEC_MASK_SIZE = 32768  # modded_dac's Transformer precomputes a causal mask this many rows square
+
+
+@contextlib.contextmanager
+def unused_codec_masks_skipped():
+    """While the codec is built, make its 32768 x 32768 causal masks empty placeholders.
+
+    Building them is torch.tril over 1 GiB each on the CPU: 15 of the codec's 22 s of loading,
+    for masks load_codec_slim then drops. Every other torch.tril call is untouched.
+    """
+    real_tril = torch.tril
+
+    def tril(input, *args, **kwargs):
+        if not args and not kwargs and input.dtype == torch.bool and input.shape == (CODEC_MASK_SIZE, CODEC_MASK_SIZE):
+            return input.new_empty(0)
+        return real_tril(input, *args, **kwargs)
+
+    torch.tril = tril
+    try:
+        yield
+    finally:
+        torch.tril = real_tril
+
+
 def load_codec_slim(checkpoint):
-    """Load the audio codec without its three unused 32768 x 32768 attention masks (3 GiB).
+    """Load the audio codec without its unused 32768 x 32768 attention masks (1 GiB each).
 
     The masks belong to WindowLimitedTransformer modules, whose forward always builds its own mask
     and passes it in; the precomputed one is read only when no mask is passed, which never happens
-    there. Dropping it changes no value and cuts the codec from about 4.6 GB to 1.6 GB of VRAM.
+    there. Dropping it changes no value and cuts the codec from about 4.6 GB to 1.6 GB of VRAM; not
+    building it at all saves 15 s of loading.
     """
-    codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu')
+    with unused_codec_masks_skipped():
+        codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu')
     for module in codec.modules():
         if isinstance(module, WindowLimitedTransformer):
             module.causal_mask = None
+        elif getattr(module, 'causal_mask', None) is not None and module.causal_mask.numel() == 0:
+            raise RuntimeError(f'{type(module).__name__} needs its causal mask, but it was skipped')
     return codec.cuda()
 
 

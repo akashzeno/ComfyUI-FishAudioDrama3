@@ -5,14 +5,16 @@ import json
 import math
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from tokenizers import Tokenizer
 
 from fish_speech.models.text2semantic.fish_omni.backbone import (
-    CHECKPOINT_BACKBONE_PREFIX, CHECKPOINT_LM_HEAD_KEY,
-    FishOmniBackbone, load_backbone_weights, module_bytes,
+    CHECKPOINT_BACKBONE_PREFIX, CHECKPOINT_LM_HEAD_KEY, EXPERT_KEY_PATTERN, STACKED_EXPERT_PARAMETER_PATTERN,
+    FishOmniBackbone, backbone_name, load_backbone_weights, module_bytes,
 )
 from fish_speech.models.text2semantic.fish_omni.config import FishOmniConfig
 from fish_speech.models.text2semantic.fish_omni.fp8_moe import (
@@ -296,25 +298,138 @@ def pin_offloaded_experts(layers, headroom_gib=PIN_HEADROOM_GIB):
     A pinned layer is packed: one buffer with one byte row per expert (packed_layout), and the four
     expert tensors become views of it, so the GPU cache receives each expert in one copy.
     """
-    import psutil
     pinned = 0
     for layer in layers:
         experts = layer.mlp.experts
         if not isinstance(experts, OffloadedFP8Experts):
             continue
-        size = module_bytes(experts)
-        if psutil.virtual_memory().available - size < headroom_gib * 2**30:
-            break
-        layout, row = packed_layout(experts)
-        packed = torch.empty((experts.num_experts, row), dtype=torch.uint8, pin_memory=True)
-        views = packed_views(packed, experts, layout)
-        for name in FIELDS:
-            views[name].copy_(getattr(experts, name))
-            setattr(experts, name, views[name])  # the pageable original is freed here
-        experts.packed = packed
-        experts.pinned = True
+        if not getattr(experts, 'pinned', False):
+            if not room_to_pin(experts, headroom_gib):
+                break
+            pack_experts(experts)
         pinned += 1
     return pinned
+
+
+def room_to_pin(experts, headroom_gib=PIN_HEADROOM_GIB):
+    """True when one more layer of experts fits in RAM with headroom to spare."""
+    import psutil
+    return psutil.virtual_memory().available - module_bytes(experts) >= headroom_gib * 2**30
+
+
+def pack_experts(experts, copy=True):
+    """Give a layer's experts one pinned buffer, one row per expert, with its four tensors as views.
+
+    copy=False only allocates: the weights are then read straight into the rows (load_backbone_direct).
+    """
+    layout, row = packed_layout(experts)
+    packed = torch.empty((experts.num_experts, row), dtype=torch.uint8, pin_memory=True)
+    views = packed_views(packed, experts, layout)
+    for name in FIELDS:
+        if copy:
+            views[name].copy_(getattr(experts, name))
+        setattr(experts, name, views[name])  # a pageable original is freed here
+    experts.packed = packed
+    experts.pinned = True
+
+
+SAFETENSORS_DTYPES = {'F8_E4M3': torch.float8_e4m3fn, 'BF16': torch.bfloat16, 'F16': torch.float16,
+                      'F32': torch.float32, 'I64': torch.int64, 'I32': torch.int32, 'U8': torch.uint8,
+                      'BOOL': torch.bool}
+
+
+def _shard_header(path):
+    """(byte offset of the tensor data, {key: {dtype, shape, data_offsets}}) of a safetensors file."""
+    with open(path, 'rb') as f:
+        size = int.from_bytes(f.read(8), 'little')
+        header = json.loads(f.read(size))
+    header.pop('__metadata__', None)
+    return 8 + size, header
+
+
+def _expected_slots(targets):
+    """Every (parameter, expert, part) the checkpoint must fill, as Fish's load_backbone_weights counts them."""
+    slots = set()
+    for name, tensor in targets.items():
+        match = STACKED_EXPERT_PARAMETER_PATTERN.fullmatch(name)
+        if match is None:
+            slots.add((name, -1, 'whole'))
+            continue
+        parts = ('gate', 'up') if match.group(2) == 'w13' else ('down',)
+        slots.update((name, expert, part) for expert in range(tensor.shape[0]) for part in parts)
+    return slots
+
+
+@torch.inference_mode()
+def load_backbone_direct(backbone, checkpoint_dir, threads=8):
+    """Fish's load_backbone_weights for an FP8 checkpoint, with packed experts read straight from disk.
+
+    The checkpoint stores each expert's gate, up and down projections (and their scales) as separate
+    tensors: 61,440 of them. Every one lands in a contiguous byte range of its expert's packed row, so
+    for packed layers the file bytes are read directly into pinned memory, one thread per shard: no
+    per-tensor copies and no pinning copy afterwards. Other tensors are copied as Fish copies them.
+    Every tensor is matched to its slot and checked (shape, and dtype for raw reads) before anything
+    is read; a missing, duplicate or unknown tensor is refused.
+    """
+    targets = dict(backbone.named_parameters()) | dict(backbone.named_buffers())
+    weight_map = json.loads((checkpoint_dir / 'model.safetensors.index.json').read_text(encoding='utf-8'))['weight_map']
+    plan, filled = {}, set()
+    for shard in sorted(set(weight_map.values())):
+        base, header = _shard_header(checkpoint_dir / shard)
+        tasks = plan[shard] = []
+        for key, info in header.items():
+            if key.startswith(AUDIO_DECODER_PREFIXES):
+                continue
+            name = backbone_name(key)
+            match = EXPERT_KEY_PATTERN.fullmatch(name)
+            if match is None:
+                if name not in targets:
+                    raise ValueError(f'checkpoint key {key!r} has no parameter {name!r}')
+                slot, destination, direct = (name, -1, 'whole'), targets[name], False
+            else:
+                prefix, expert = f"model.layers.{match['layer']}.mlp.experts", int(match['expert'])
+                suffix = 'scale_inv' if match['kind'] == 'weight_scale_inv' else 'weight'
+                if match['proj'] == 'down_proj':
+                    slot_name, part = f'{prefix}.w2_{suffix}', 'down'
+                    destination = targets[slot_name][expert]
+                else:
+                    slot_name, part = f'{prefix}.w13_{suffix}', 'gate' if match['proj'] == 'gate_proj' else 'up'
+                    rows = targets[slot_name].shape[1] // 2
+                    destination = targets[slot_name][expert, :rows] if part == 'gate' else targets[slot_name][expert, rows:]
+                slot = (slot_name, expert, part)
+                direct = getattr(backbone.get_submodule(prefix), 'packed', None) is not None
+            dtype = SAFETENSORS_DTYPES.get(info['dtype'])
+            if tuple(info['shape']) != tuple(destination.shape):
+                raise ValueError(f"{key}: checkpoint shape {info['shape']} != model shape {tuple(destination.shape)}")
+            if (direct and dtype != destination.dtype) or (destination.dtype == torch.float8_e4m3fn and dtype != destination.dtype):
+                raise ValueError(f"{key}: checkpoint dtype {info['dtype']} cannot fill {destination.dtype}")
+            if slot in filled:
+                raise ValueError(f'{slot} appears twice in the checkpoint')
+            filled.add(slot)
+            start, end = info['data_offsets']
+            tasks.append((base + start, end - start, key, destination, direct))
+    if missing := _expected_slots(targets) - filled:
+        raise ValueError(f'{len(missing)} backbone tensors are not in the checkpoint, e.g. {sorted(missing)[:4]}')
+
+    def read(shard, tasks):
+        with torch.inference_mode(), open(checkpoint_dir / shard, 'rb', buffering=0) as raw, \
+                safe_open(str(checkpoint_dir / shard), framework='pt', device='cpu') as tensors:
+            for offset, size, key, destination, direct in sorted(tasks, key=lambda task: task[0]):
+                if not direct:
+                    destination.copy_(tensors.get_tensor(key))
+                    continue
+                view = memoryview(destination.view(torch.uint8).numpy()).cast('B')
+                raw.seek(offset)
+                done = 0
+                while done < size:
+                    count = raw.readinto(view[done:])
+                    if not count:
+                        raise ValueError(f'{shard} ends inside {key}')
+                    done += count
+
+    with ThreadPoolExecutor(max(1, min(threads, len(plan)))) as pool:
+        for future in [pool.submit(read, shard, tasks) for shard, tasks in plan.items()]:
+            future.result()
 
 
 @torch.inference_mode()
@@ -365,7 +480,12 @@ def load_offloaded_model(checkpoint_dir: str | Path, gpu_budget_gib=26.0, device
             if name != "experts":
                 child.to_empty(device=device)
         experts = layer.mlp.experts
-        experts.to_empty(device=device if index < resident else "cpu")
+        if index < resident:
+            experts.to_empty(device=device)
+        elif resident == 0 and room_to_pin(experts):
+            pack_experts(experts, copy=False)  # load_backbone_direct reads the weights straight in
+        else:
+            experts.to_empty(device="cpu")
         if index >= resident:
             experts.__class__ = OffloadedFP8Experts
             experts.staging_pool = pool
@@ -384,7 +504,10 @@ def load_offloaded_model(checkpoint_dir: str | Path, gpu_budget_gib=26.0, device
         "expert_cache_GiB": cache_capacity * per_expert * len(layers) / 2**30,
     }), flush=True)
     started = time.perf_counter()
-    load_backbone_weights(backbone, iter_checkpoint_tensors(checkpoint_dir, skip_prefixes=AUDIO_DECODER_PREFIXES))
+    if resident == 0:  # every layer streams: experts go straight from the files into pinned rows
+        load_backbone_direct(backbone, checkpoint_dir)
+    else:
+        load_backbone_weights(backbone, iter_checkpoint_tensors(checkpoint_dir, skip_prefixes=AUDIO_DECODER_PREFIXES))
     load_audio_decoder_weights(tower, iter_checkpoint_tensors(checkpoint_dir, skip_prefixes=(CHECKPOINT_BACKBONE_PREFIX, CHECKPOINT_LM_HEAD_KEY)))
     tokenizer = Tokenizer.from_file(str(checkpoint_dir / "tokenizer.json"))
     model = FishOmniModel(config, backbone, tower, tokenizer).eval()

@@ -14,7 +14,7 @@ weights**, on a **16 GB GPU**.
   used kept in a GPU cache. Same weights, same maths — nothing is re-quantised.
 - **Fast.** With the model loaded, an 8-second line generates in about 12 seconds: each decoding
   step is replayed from CUDA graphs, even with the experts streaming from RAM.
-- **Keeps the model loaded between runs.** The first run of a session loads it (about 2 min);
+- **Keeps the model loaded between runs.** The first run of a session loads it (about 45 s);
   later runs start generating at once. It hands the GPU back on its own the moment ComfyUI loads any
   other model, after an idle period, or when you press *Free memory*.
 - **Shows its work.** The node's progress bar moves through loading and generation, and the model's
@@ -131,9 +131,13 @@ What we learned the hard way:
     kernel reads the cache directly; weights and maths are unchanged.
   - Leftover VRAM goes to the cache rather than to whole resident layers: a slot serves all 40
     layers, a resident layer only one. If the whole model fits, nothing streams at all.
-- **A lighter codec.** The audio codec builds three 32,768 × 32,768 attention masks (3 GB) that its
-  windowed transformers never read — they always build their own mask. They are dropped at load,
-  which takes the codec from 4.6 GB to 1.6 GB of VRAM.
+- **A lighter codec.** The audio codec builds 32,768 × 32,768 attention masks (1 GB each) that its
+  windowed transformers never read — they always build their own mask. They are never built (that
+  alone took 15 s of loading) and the codec takes 1.6 GB of VRAM instead of 4.6 GB.
+- **Fast loading.** The checkpoint stores every expert's projections as separate tensors (61,440
+  of them). Each lands in one contiguous range of its expert's packed row, so they are read from
+  disk straight into pinned RAM, one thread per file, with no copy afterwards. Model loading:
+  62 s → 20 s; the worker is ready about 45 s after the first run starts, instead of 93 s.
 - **Giving the GPU back.** ComfyUI can't see memory used by another process, so the node wraps
   `load_models_gpu` and `unload_all_models`: before any other model loads onto the GPU, the Drama 3
   process is asked to exit.
@@ -176,7 +180,7 @@ What we learned the hard way:
 
 | | |
 |---|---|
-| Loading codec + model (and locking the experts in RAM) | about 2 min, once per session with `keep_loaded` |
+| Loading codec + model (and locking the experts in RAM) | about 45 s, once per session with `keep_loaded` |
 | An 8 s line, model already loaded | **about 12 s** (prefill 2 s, decoding 0.06 s per frame) |
 | Three takes of it (`variations` 3) | **about 35 s** (the prompt is read once) |
 | The same line with `fast_mode` off | about 70 s (prefill 14 s, decoding 0.3 s per frame) |
@@ -219,6 +223,7 @@ python tests\test_speaker_dialogue.py
 python tests\test_expert_cache.py
 python tests\test_backbone_graphs.py   # needs an FP8 GPU
 python tests\test_prompt_reuse.py      # needs an FP8 GPU
+python tests\test_fast_load.py
 ```
 
 The speed work is also checked end to end on the GPU: with `fast_mode` off, the same request and
