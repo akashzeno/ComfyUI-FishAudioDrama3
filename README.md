@@ -6,6 +6,33 @@ Run [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) locally in Co
 
 **Unofficial integration. Built with Fish Audio.** Experimental Windows implementation, validated with ComfyUI 0.39.0 and frontend 1.55.17.
 
+## This fork: run with ComfyUI's own Python (comfyenv mode)
+
+Fork of [Nebuluss/Drama-3](https://github.com/Nebuluss/Drama-3). Instead of building a separate
+Python 3.12 environment, each job runs in a **separate process started with ComfyUI's own
+interpreter** — the same environment, nothing pip-installed. The process still exits after every
+job, so the ~12 GB of VRAM and the pinned RAM it uses go back to ComfyUI.
+
+Everything Drama 3 imports was already present in the tested ComfyUI environment (torch 2.14.1,
+Triton 3.8.0). The one missing package, `natsort`, is used only by a Fish Speech file-listing
+helper; the runner substitutes `sorted` when it is absent.
+
+```powershell
+# from this folder, with ComfyUI's Python
+python setup_comfyenv.py --checkpoint-dir D:\Models\drama-3              # Fish Speech + self-check
+python setup_comfyenv.py --checkpoint-dir D:\Models\drama-3 --download   # + the 41.5 GB checkpoint
+```
+
+`setup_comfyenv.py` fetches Fish Speech at the same pinned commit as `install.ps1` into `local/`
+(git-ignored), applies `runtime/streaming.patch`, writes `local/model-location.json`, and runs
+`runtime/selfcheck.py`: every import a job needs, then Fish's FP8 MoE kernels on the GPU against
+the same maths in fp32 (pass: cosine > 0.995 — the RTX 5080 scores 0.999). Run it before
+downloading the weights.
+
+Leave the node's `runtime_folder` blank for comfyenv mode. A folder made by `install.ps1`
+(recognised by its `drama3-env`) still runs upstream's isolated environment. Tested on an RTX 5080
+16 GB with 64 GB RAM, which upstream has not validated.
+
 ## Listen to the examples
 
 **[▶ Open the audio gallery — play directly in your browser](https://nebuluss.github.io/Drama-3/)**
