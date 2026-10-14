@@ -1,4 +1,4 @@
-"""ComfyUI integration for the isolated local Drama 3 FP8 runtime."""
+"""ComfyUI integration for local Fish Audio Drama 3 (original FP8 weights, experts streamed from RAM)."""
 import json
 import os
 import shutil
@@ -20,6 +20,38 @@ from server import PromptServer
 from .take_io import load_take, save_take
 from .runtime_paths import resolve_launch
 from .log_echo import LogEcho
+from .worker_manager import PersistentWorker
+
+
+def to_terminal(text):
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+WORKER = PersistentWorker(folder_paths.get_temp_directory(), to_terminal)
+_unload_all_models = model_management.unload_all_models
+_load_models_gpu = model_management.load_models_gpu
+
+
+def _release_worker(reason):
+    if WORKER.alive():
+        WORKER.stop(reason)
+
+
+def _load_models_gpu_releasing_drama3(*args, **kwargs):
+    _release_worker('ComfyUI is loading another model onto the GPU')
+    return _load_models_gpu(*args, **kwargs)
+
+
+def _unload_all_models_releasing_drama3(*args, **kwargs):
+    _release_worker('ComfyUI was asked to free memory')
+    return _unload_all_models(*args, **kwargs)
+
+
+# The worker holds ~13 GB of VRAM and ~28 GB of pinned RAM between jobs. ComfyUI cannot see that,
+# so give the GPU back before any other model loads and when memory is freed.
+model_management.load_models_gpu = _load_models_gpu_releasing_drama3
+model_management.unload_all_models = _unload_all_models_releasing_drama3
 
 NODE_DIR = Path(__file__).resolve().parent
 CONFIG = NODE_DIR / 'runtime.json'
@@ -64,6 +96,8 @@ class Drama3FP8Speech:
             'use_history': ('BOOLEAN', {'default': True, 'tooltip': 'Use previous audio as context. Disable to retain its reference voices but start fresh.'}),
             'variations': ('INT', {'default': 1, 'min': 1, 'max': 64, 'tooltip': 'Seeds increment across takes. Model is loaded once per job.'}),
             'streaming': ('BOOLEAN', {'default': False, 'tooltip': 'Decode and preview during generation. Uses more RAM offloading and may run slower.'}),
+            'keep_loaded': ('BOOLEAN', {'default': True, 'tooltip': 'Keep the model loaded between runs (saves about 1.5 min per run). It is unloaded after idle_unload_minutes, or as soon as ComfyUI loads another model onto the GPU.'}),
+            'idle_unload_minutes': ('INT', {'default': 10, 'min': 1, 'max': 240, 'tooltip': 'Unload the kept model after this many minutes without a run.'}),
         }, 'hidden': {'unique_id': 'UNIQUE_ID'}}
 
     RETURN_TYPES = ('AUDIO', 'DRAMA3_TAKE', 'STRING')
@@ -76,7 +110,8 @@ class Drama3FP8Speech:
     def synthesize(self, text, seed, max_frames, runtime_folder, release_comfy_models,
                    reference_audio=None, reference_text='', temperature=.7, top_p=.7, top_k=30,
                    voices=None, previous_take=None, direction='', chunk_mode='auto', chunk_bytes=300,
-                   history_turns=1, use_history=True, variations=1, streaming=False, unique_id=None):
+                   history_turns=1, use_history=True, variations=1, streaming=False, keep_loaded=True,
+                   idle_unload_minutes=10, unique_id=None):
         if not text.strip():
             raise ValueError('Enter some text to speak.')
         if reference_audio is not None and not reference_text.strip():
@@ -90,13 +125,20 @@ class Drama3FP8Speech:
             if missing:
                 raise RuntimeError(f'Drama 3 is not set up in {runtime} (missing {", ".join(missing)}). '
                                    f'Run: python "{NODE_DIR / "setup_comfyenv.py"}" --checkpoint-dir <folder>')
-        if release_comfy_models:
-            model_management.unload_all_models()
-            model_management.soft_empty_cache()
-        free_bytes, _ = torch.cuda.mem_get_info(0)
-        budget = min(26., free_bytes / 2**30 - 2.5)
-        if budget < (11.5 if streaming else 8.):
-            raise RuntimeError('Free other GPU workloads before running Drama 3.')
+        persistent = keep_loaded and launch['mode'] == 'comfyenv'
+        key = (str(python), str(runner), str(runtime))
+        reuse = persistent and WORKER.matches(key)
+        if reuse:
+            budget = WORKER.budget
+        else:
+            _release_worker('settings changed')
+            if release_comfy_models:
+                _unload_all_models()
+                model_management.soft_empty_cache()
+            free_bytes, _ = torch.cuda.mem_get_info(0)
+            budget = min(26., free_bytes / 2**30 - 2.5)
+            if budget < (11.5 if streaming or persistent else 8.):
+                raise RuntimeError('Free other GPU workloads before running Drama 3.')
         temp_root = Path(folder_paths.get_temp_directory())
         temp_root.mkdir(parents=True, exist_ok=True)
         session = uuid.uuid4().hex
@@ -160,9 +202,23 @@ class Drama3FP8Speech:
                             event.update(audio=name, type='temp', subfolder='')
                         notify(event)
 
-            def to_terminal(text):
-                sys.stdout.write(text)
-                sys.stdout.flush()
+            if persistent:
+                if not reuse:
+                    notify({'stage': 'Starting the Drama 3 worker: loading the model once (about 1.5 min)', 'progress': .02})
+                    print(f'[Drama 3] starting the worker (GPU budget {budget:.1f} GB, unloads after '
+                          f'{idle_unload_minutes} idle minutes)', flush=True)
+                    WORKER.start(key, [python, '-u', runner], runtime, os.environ | launch['env'], budget, idle_unload_minutes * 60)
+                    WORKER.wait_ready(model_management.throw_exception_if_processing_interrupted)
+                else:
+                    print('[Drama 3] model already loaded: reusing the worker', flush=True)
+                print(f'[Drama 3] job started ({variations} take(s))', flush=True)
+                try:
+                    WORKER.run(request, output, model_management.throw_exception_if_processing_interrupted, read_events)
+                except BaseException:
+                    notify({'stage': 'Stopped' if not WORKER.alive() else 'Failed - see error details'})
+                    raise
+                print('\n[Drama 3] job finished', flush=True)
+                return self.collect(temp, output, progress)
 
             echo = LogEcho(log_path, to_terminal)
             print(f'[Drama 3] job started ({launch["mode"]} mode, {variations} take(s), GPU budget {budget:.1f} GB)', flush=True)
@@ -195,19 +251,23 @@ class Drama3FP8Speech:
                 detail = log_path.read_text(encoding='utf-8', errors='replace')[-6000:]
                 notify({'stage': 'Failed - see error details'})
                 raise RuntimeError(f'Drama 3 generation failed:\n{detail}')
-            stats = json.loads(output.with_suffix('.json').read_text(encoding='utf-8'))
-            audios, takes, infos = [], [], []
-            for result in stats['results']:
-                audio_path = (temp / result['audio']).resolve()
-                take_path = (temp / result['take']).resolve()
-                if audio_path.parent != temp.resolve() or take_path.parent != temp.resolve():
-                    raise ValueError('Invalid runtime result path.')
-                samples, rate = sf.read(audio_path, dtype='float32', always_2d=True)
-                audios.append({'waveform': torch.from_numpy(np.ascontiguousarray(samples.T)).unsqueeze(0), 'sample_rate': rate})
-                takes.append(load_take(take_path))
-                infos.append(json.dumps({k: v for k, v in stats.items() if k != 'results'} | result, indent=2))
-            progress.update_absolute(1000)
-            return audios, takes, infos
+            return self.collect(temp, output, progress)
+
+    @staticmethod
+    def collect(temp, output, progress):
+        stats = json.loads(output.with_suffix('.json').read_text(encoding='utf-8'))
+        audios, takes, infos = [], [], []
+        for result in stats['results']:
+            audio_path = (temp / result['audio']).resolve()
+            take_path = (temp / result['take']).resolve()
+            if audio_path.parent != temp.resolve() or take_path.parent != temp.resolve():
+                raise ValueError('Invalid runtime result path.')
+            samples, rate = sf.read(audio_path, dtype='float32', always_2d=True)
+            audios.append({'waveform': torch.from_numpy(np.ascontiguousarray(samples.T)).unsqueeze(0), 'sample_rate': rate})
+            takes.append(load_take(take_path))
+            infos.append(json.dumps({k: v for k, v in stats.items() if k != 'results'} | result, indent=2))
+        progress.update_absolute(1000)
+        return audios, takes, infos
 
 
 class Drama3Voice:
