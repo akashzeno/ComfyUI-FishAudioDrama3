@@ -37,6 +37,7 @@ import torchaudio
 from fp8_offload import load_offloaded_model
 from take_io import load_take, save_take
 from fish_speech.models.dac.inference import load_model as load_codec
+from fish_speech.models.dac.modded_dac import WindowLimitedTransformer
 from fish_speech.models.text2semantic.fish_omni.chunking import Drama3History, PROTECTED_SPAN, parse_speaker_segments, split_drama3_text
 from fish_speech.models.text2semantic.fish_omni.generate import Drama3PromptTooLongError, build_drama3_prompt, generate_drama3
 
@@ -156,7 +157,21 @@ def build_speaker_prompt(chunk, tokenizer, config, voices):
         [torch.from_numpy(ref['codes']).long() for ref in references])
 
 
-CODEC_RESERVE_GIB = 3.5  # VRAM kept free for the codec beside the model (as streaming already did)
+CODEC_RESERVE_GIB = 3.0  # codec beside the model: 1.6 GB of weights + up to 0.95 GB while encoding
+
+
+def load_codec_slim(checkpoint):
+    """Load the audio codec without its three unused 32768 x 32768 attention masks (3 GiB).
+
+    The masks belong to WindowLimitedTransformer modules, whose forward always builds its own mask
+    and passes it in; the precomputed one is read only when no mask is passed, which never happens
+    there. Dropping it changes no value and cuts the codec from about 4.6 GB to 1.6 GB of VRAM.
+    """
+    codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu')
+    for module in codec.modules():
+        if isinstance(module, WindowLimitedTransformer):
+            module.causal_mask = None
+    return codec.cuda()
 
 
 def checkpoint_info():
@@ -171,7 +186,7 @@ def load_state(budget):
     That only moves the split between resident and staged experts, which compute the same values.
     """
     checkpoint, revision = checkpoint_info()
-    codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu').cuda()
+    codec = load_codec_slim(checkpoint)
     # The first encode in a process takes slightly different floating-point paths than every later
     # one (equally accurate: the same reconstruction error, but different codes). A one-job process
     # always encodes its reference first, so the worker caches each reference's codes: the first
@@ -204,7 +219,7 @@ def run_job(job, output, budget, state=None):
     if refs or (job.get('previous_audio') and job.get('use_history', True)) or streaming:
         emit(stage='Encoding references' if state else 'Encoding references / loading audio codec', progress=.02)
         if codec is None:
-            codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu').cuda()
+            codec = load_codec_slim(checkpoint)
     replaced = {ref['speaker_id'] for ref in refs}
     voices = [ref for ref in previous['voices'] if ref['speaker_id'] not in replaced]
     for ref in refs:
@@ -311,7 +326,7 @@ def run_job(job, output, budget, state=None):
         torch.cuda.empty_cache()
     emit(stage='Saving audio and reusable takes', progress=.96)
     if codec is None:
-        codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu').cuda()
+        codec = load_codec_slim(checkpoint)
     files = []
     for variation, result in enumerate(results):
         if not streaming:
