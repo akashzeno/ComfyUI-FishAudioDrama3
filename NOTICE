@@ -22,6 +22,8 @@ run_drama3_full.py --serve); generation progress and the job log are reported to
 (log_echo.py); an FP8 kernel self-check (runtime/selfcheck.py); the routed experts are pinned in
 RAM and copied straight to the GPU, with a per-layer GPU cache of recently used experts, and the
 audio codec drops three attention masks its modules never read (runtime/fp8_offload.py,
-run_drama3_full.py); the audio decoder's decode step is replayed from CUDA graphs built on
-Fish Speech's own graph code path (runtime/drama3_generate.py). The Fish Audio Materials
+run_drama3_full.py); in fast mode each decode step is replayed from CUDA graphs built on Fish
+Speech's own graph code path — the audio decoder, and the backbone in pieces between expert
+fetches — and the prompt is read in larger chunks (runtime/drama3_generate.py,
+run_drama3_full.py). The Fish Audio Materials
 themselves are not modified beyond upstream's runtime/streaming.patch.

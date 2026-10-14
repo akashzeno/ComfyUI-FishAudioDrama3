@@ -1,13 +1,17 @@
-"""Drama 3 generation with the audio decoder captured as CUDA graphs, the backbone run eagerly.
+"""Drama 3 decoding replayed from CUDA graphs, with the routed experts streamed from RAM.
 
-Fish Speech captures a whole decode step (lm_head -> audio decoder -> backbone) as CUDA graphs,
-because eager decoding is bound by kernel launches. With experts streamed from RAM the backbone
-cannot be captured: every layer stops on the CPU to fetch the experts its router picked. The audio
-decoder (the "tower") has no such stop, so this captures lm_head + tower + the next step's input
-embedding and leaves only the backbone eager. The captured part is Fish's own graph code path —
-padded attention buckets and device-side sampling parameters — so takes are Fish's default numerics,
-not bit-identical to the fully eager path.
+Eager decoding is bound by kernel launches: thousands of small kernels per audio frame. Fish Speech
+captures a whole decode step (lm_head -> audio decoder -> backbone) as CUDA graphs, but with experts
+streamed from RAM one graph cannot span a step: every streamed layer stops on the CPU to fetch the
+experts its router picked. So the step is captured in pieces:
 
+- the audio decoder (the "tower"): lm_head -> sample a frame -> the next step's input embedding;
+- the backbone, cut at each streamed layer's router: the CPU reads the router's picks, copies the
+  missing experts into that layer's GPU cache and writes their slots to a static buffer, then the
+  next piece (those experts, then the next layer's attention and router) is replayed.
+
+The pieces run Fish's own graph code path - attention over padded cache buckets, sampling settings
+held on the GPU - so takes repeat exactly but are not bit-identical to the fully eager path.
 Graphs are captured once per loaded model, before any seed is set: capturing runs the sampler and
 would otherwise shift the random stream of the first take.
 """
@@ -19,15 +23,41 @@ from loguru import logger
 from tqdm import tqdm
 
 from fish_speech.models.text2semantic.errors import InvalidInputError
+from fish_speech.models.text2semantic.fish_omni.fp8_moe import fp8_moe_forward
 from fish_speech.models.text2semantic.fish_omni.generate import (
     DRAMA3_GRAPH_CAPACITY, DRAMA3_GRAPH_KV_BUCKETS, ensure_drama3_caches)
+from fish_speech.models.text2semantic.fish_omni.layers import LayerContext
 from fish_speech.models.text2semantic.fish_omni.tower import RAS_WINDOW_FRAMES
 
+from fp8_offload import FIELDS, OffloadedFP8Experts
 
-class TowerDecodeGraphs:
+
+def capture_graph(run, pool, stream):
+    """Warm run() up on a side stream, then capture it into a CUDA graph.
+
+    Share one warm-up stream between captures: the allocator keeps each stream's freed blocks for
+    that stream alone, so a new stream per capture leaves every warm-up's memory stranded
+    (measured: 0.86 GiB over the backbone's pieces).
+    """
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=pool):
+        run()
+    return graph
+
+
+def bucket_for(buckets, rows):
+    return next(b for b in buckets if b >= rows)
+
+
+class TowerGraphs:
     """CUDA graphs of lm_head -> audio decoder (sample a frame) -> next input embedding."""
 
-    def __init__(self, model):
+    def __init__(self, model, buckets, pool, stream):
         backbone, tower = model.backbone, model.audio_decoder
         self.model = model
         device = tower.device
@@ -42,26 +72,8 @@ class TowerDecodeGraphs:
         self.top_p = torch.zeros((), dtype=torch.float32, device=device)
         self.finite = torch.ones((), dtype=torch.bool, device=device)
         self.embeddings = None
-        self.graphs = {}
-        self.pool = torch.cuda.graph_pool_handle()
-        self.capacity = min(DRAMA3_GRAPH_CAPACITY, model.config.text.max_position_embeddings)
-        self.buckets = tuple(sorted({min(b, self.capacity) for b in DRAMA3_GRAPH_KV_BUCKETS}))
-
-    @classmethod
-    @torch.inference_mode()
-    def build(cls, model):
-        """Capture the graphs for a loaded model, or None when they cannot or should not be used."""
-        if os.environ.get('DRAMA3_CUDA_GRAPHS', '1') == '0' or model.audio_decoder.device.type != 'cuda':
-            return None
-        ensure_drama3_caches(model, min(DRAMA3_GRAPH_CAPACITY, model.config.text.max_position_embeddings))
-        graphs = cls(model)
-        started = time.perf_counter()
-        with torch.cuda.device(model.audio_decoder.device):
-            for kv_len in graphs.buckets:
-                graphs.capture(kv_len)
-        logger.info(f'Drama 3 audio-decoder CUDA graphs: kv buckets {graphs.buckets} captured in '
-                    f'{time.perf_counter() - started:.1f}s')
-        return graphs
+        self.buckets = buckets
+        self.graphs = {kv_len: self.capture(kv_len, pool, stream) for kv_len in buckets}
 
     def tower_attentions(self):
         tower = self.model.audio_decoder
@@ -78,23 +90,14 @@ class TowerDecodeGraphs:
         self.sampled.copy_(sampled)
         embeddings = tower.embed_backbone(sampled, backbone.embed(sampled[:, 0]))
         if self.embeddings is None:  # first warm-up run, outside capture
-            self.embeddings = torch.empty_like(embeddings)
-        self.embeddings.copy_(embeddings)
+            self.embeddings = torch.empty_like(embeddings[None])
+        self.embeddings.copy_(embeddings[None])
 
-    def capture(self, kv_len):
+    def capture(self, kv_len, pool, stream):
         for attention in self.tower_attentions():
             attention.static_kv_len = kv_len
         try:
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(2):
-                    self.run()
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self.pool):
-                self.run()
-            self.graphs[kv_len] = graph
+            return capture_graph(self.run, pool, stream)
         finally:
             for attention in self.tower_attentions():
                 attention.static_kv_len = None
@@ -112,9 +115,8 @@ class TowerDecodeGraphs:
         self.top_p.fill_(top_p)
 
     def step(self, position):
-        """Sample the frame after position; returns (frame, main token, next input embedding)."""
-        kv_len = next(b for b in self.buckets if b >= position + 1)
-        self.graphs[kv_len].replay()
+        """Sample the frame after position; returns (frame, main token, next input embedding [1, 1, H])."""
+        self.graphs[bucket_for(self.buckets, position + 1)].replay()
         sampled = self.sampled.clone()
         main, finite = torch.stack((sampled[0, 0], self.finite.long())).tolist()
         if not finite:
@@ -122,17 +124,190 @@ class TowerDecodeGraphs:
         return sampled, main, self.embeddings
 
     def advance(self, hidden, sampled):
-        """After the eager backbone step: the next step's hidden row, frame, history and position."""
+        """After the backbone step: the next step's hidden row, frame, history and position."""
         self.hidden.copy_(hidden)
         self.frame.copy_(sampled)
         self.history.copy_(torch.cat((self.history[1:], sampled[0, :1])))
         self.position.add_(1)
 
 
+class BackboneGraphs:
+    """CUDA graphs of one backbone decode step, cut at every streamed layer's router.
+
+    Piece s runs the experts of the previous streamed layer, the resident layers after it, and the
+    attention and router of the next streamed layer. Between pieces the CPU fetches that layer's
+    experts into its GPU cache. With every layer streamed, a step is 41 graph launches instead of
+    about 6,800 kernel launches.
+    """
+
+    def __init__(self, backbone, buckets, pool, stream):
+        self.backbone = backbone
+        self.layers = list(backbone.model.layers)
+        self.buckets = buckets
+        self.stops = [i for i, layer in enumerate(self.layers) if isinstance(layer.mlp.experts, OffloadedFP8Experts)]
+        device = backbone.model.norm.weight.device
+        hidden = backbone.config.hidden_size
+        top_k = self.layers[0].mlp.top_k
+        rotary = backbone.config.rotary_dim
+        frequencies = backbone.inverse_frequencies.get(device)
+        if frequencies is None:  # as FishOmniBackbone.run_layers computes them
+            exponents = torch.arange(0, rotary, 2, dtype=torch.float32, device=device)
+            frequencies = 1.0 / (backbone.config.rope_theta ** (exponents / rotary))
+        self.frequencies = frequencies
+        self.embeddings = torch.zeros((1, 1, hidden), dtype=backbone.dtype, device=device)
+        self.position = torch.zeros(1, dtype=torch.long, device=device)
+        self.cos = torch.zeros((1, rotary), dtype=torch.float32, device=device)
+        self.sin = torch.zeros_like(self.cos)
+        self.residual = torch.zeros((1, 1, hidden), dtype=backbone.residual_dtype, device=device)
+        self.routed = torch.zeros((1, hidden), dtype=backbone.dtype, device=device)
+        self.weights = torch.zeros((1, top_k), dtype=backbone.dtype, device=device)
+        self.ids = torch.zeros((1, top_k), dtype=torch.long, device=device)
+        self.slots = torch.zeros((1, top_k), dtype=torch.long, device=device)
+        self.output = torch.zeros((1, 1, hidden), dtype=backbone.dtype, device=device)
+        self.graphs = {}
+        for piece in range(len(self.stops) + 1):
+            for kv_len in (buckets if self.attends(piece) else (None,)):
+                self.graphs[piece, kv_len] = capture_graph(
+                    lambda: self.run_piece(piece, kv_len or buckets[-1]), pool, stream)
+
+    @classmethod
+    def build(cls, backbone, buckets, pool=None, stream=None):
+        """Capture the graphs, or None when a layer cannot be graphed (several devices, no expert cache)."""
+        device = backbone.model.norm.weight.device
+        if device.type != 'cuda':
+            return None
+        for layer in backbone.model.layers:
+            if layer.input_layernorm.weight.device != device:
+                return None
+            experts = layer.mlp.experts
+            if isinstance(experts, OffloadedFP8Experts):
+                cache = getattr(experts, 'expert_cache', None)
+                if cache is None or cache.capacity < layer.mlp.top_k:
+                    return None
+            elif experts.w13_weight.device != device:
+                return None
+        with torch.cuda.device(device):
+            return cls(backbone, tuple(buckets), pool if pool is not None else torch.cuda.graph_pool_handle(),
+                       stream if stream is not None else torch.cuda.Stream())
+
+    def piece_layers(self, piece):
+        """The layers whose attention runs in this piece."""
+        first = self.stops[piece - 1] + 1 if piece else 0
+        last = self.stops[piece] + 1 if piece < len(self.stops) else len(self.layers)
+        return range(first, last)
+
+    def attends(self, piece):
+        return any(self.layers[i].layer_type == 'full_attention' for i in self.piece_layers(piece))
+
+    def run_piece(self, piece, kv_len):
+        context = LayerContext(input_pos=self.position, cos=self.cos, sin=self.sin, kv_len=kv_len,
+                               continue_state=True, use_cache=True)
+        if piece == 0:
+            angles = self.position.float()[:, None] * self.frequencies[None, :]
+            angles = torch.cat((angles, angles), dim=-1)
+            self.cos.copy_(angles.cos())
+            self.sin.copy_(angles.sin())
+            x = self.embeddings.to(self.backbone.residual_dtype)
+        else:
+            x = self.finish_experts(self.layers[self.stops[piece - 1]])
+        for index in self.piece_layers(piece):
+            layer = self.layers[index]
+            if piece < len(self.stops) and index == self.stops[piece]:
+                self.attend_and_route(layer, x, context)
+                return
+            x = layer(x, context)
+        norm = self.backbone.model.norm
+        self.output.copy_(norm(x).to(self.backbone.dtype))
+
+    def attend_and_route(self, layer, x, context):
+        """DecoderLayer.forward up to the router (SparseMoeBlock.forward's first half)."""
+        compute_dtype = layer.input_layernorm.weight.dtype
+        mixer = layer.self_attn if layer.layer_type == 'full_attention' else layer.linear_attn
+        x = x + mixer(layer.input_layernorm(x).to(compute_dtype), context)
+        flat = layer.post_attention_layernorm(x).to(compute_dtype).reshape(-1, x.shape[-1])
+        moe = layer.mlp
+        probabilities = torch.softmax(moe.gate(flat).float(), dim=-1)
+        weights, ids = probabilities.topk(moe.top_k, dim=-1)
+        if moe.norm_topk_prob:
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        self.residual.copy_(x)
+        self.routed.copy_(flat)
+        self.weights.copy_(weights.to(flat.dtype))
+        self.ids.copy_(ids)
+
+    def finish_experts(self, layer):
+        """The rest of the layer: the fetched experts from the cache, the shared expert, the residual."""
+        moe = layer.mlp
+        cache = moe.experts.expert_cache
+        out = fp8_moe_forward(self.routed, self.slots, self.weights, *(cache.gpu[name] for name in FIELDS))
+        shared_gate = torch.sigmoid(moe.shared_expert_gate(self.routed))
+        return self.residual + (out + shared_gate * moe.shared_expert(self.routed)).view_as(self.residual)
+
+    def fetch(self, layer):
+        """Read the router's picks, copy missing experts into the cache, point the kernel at their slots."""
+        experts = layer.mlp.experts
+        slots, _ = experts.staging_pool.stage(experts, self.ids)
+        self.slots.copy_(slots)
+
+    def step(self, embeddings, position):
+        """The backbone at position for input embeddings [1, 1, H]; returns the final-norm hidden [1, 1, H].
+
+        The result is a static buffer, overwritten by the next step.
+        """
+        kv_len = bucket_for(self.buckets, position + 1)
+        self.embeddings.copy_(embeddings)
+        self.position.fill_(position)
+        for piece in range(len(self.stops) + 1):
+            if piece:
+                self.fetch(self.layers[self.stops[piece - 1]])
+            self.graphs[piece, kv_len if self.attends(piece) else None].replay()
+        return self.output
+
+
+class DecodeGraphs:
+    """The audio decoder's and, when possible, the backbone's decode-step graphs for one model."""
+
+    def __init__(self, model, tower, backbone, capacity):
+        self.model, self.tower, self.backbone, self.capacity = model, tower, backbone, capacity
+        self.cache_rows = model.cache_capacity
+
+    @classmethod
+    @torch.inference_mode()
+    def build(cls, model):
+        """Capture the graphs for a loaded model, or None when they cannot or should not be used."""
+        if os.environ.get('DRAMA3_FAST_MODE', '1') == '0' or model.audio_decoder.device.type != 'cuda':
+            return None
+        capacity = min(DRAMA3_GRAPH_CAPACITY, model.config.text.max_position_embeddings)
+        buckets = tuple(sorted({min(b, capacity) for b in DRAMA3_GRAPH_KV_BUCKETS}))
+        ensure_drama3_caches(model, capacity)
+        pool = torch.cuda.graph_pool_handle()
+        device = model.audio_decoder.device
+        started, before = time.perf_counter(), torch.cuda.memory_reserved(device)
+        with torch.cuda.device(device):
+            stream = torch.cuda.Stream()
+            tower = TowerGraphs(model, buckets, pool, stream)
+        after_tower = torch.cuda.memory_reserved(device)
+        backbone = BackboneGraphs.build(model.backbone, buckets, pool, stream)
+        logger.info(f'Drama 3 CUDA graphs: audio decoder{" and backbone" if backbone else ""}, kv buckets '
+                    f'{buckets}, captured in {time.perf_counter() - started:.1f}s, VRAM reserved '
+                    f'+{(after_tower - before) / 2**30:.2f} GiB (decoder) '
+                    f'+{(torch.cuda.memory_reserved(device) - after_tower) / 2**30:.2f} GiB (backbone), '
+                    f'allocated {torch.cuda.memory_allocated(device) / 2**30:.2f} GiB')
+        return cls(model, tower, backbone, capacity)
+
+    def fits(self, rows):
+        """True when a request of rows prompt + new frames can use these graphs.
+
+        The graphs captured the attention caches; eager generation of a longer request reallocates
+        them, after which the graphs must not be replayed.
+        """
+        return rows <= self.capacity and self.model.cache_capacity == self.cache_rows
+
+
 @torch.inference_mode()
 def generate_drama3_graphed(model, prompt, *, graphs, max_new_tokens, temperature, top_k, top_p,
                             prefill_chunk_size, frame_callback=None, stream_interval=64):
-    """Fish's generate_drama3 with the decode step's audio decoder replayed from CUDA graphs.
+    """Fish's generate_drama3 with the decode step replayed from CUDA graphs.
 
     Prefill is unchanged. Returns CPU [frames, 1 + N] without EOS, and the finish reason.
     """
@@ -141,7 +316,7 @@ def generate_drama3_graphed(model, prompt, *, graphs, max_new_tokens, temperatur
     backbone, tower = model.backbone, model.audio_decoder
     prompt_rows = len(prompt)
     capacity = prompt_rows + max_new_tokens
-    if max_new_tokens < 1 or capacity > graphs.capacity:
+    if max_new_tokens < 1 or not graphs.fits(capacity):
         raise ValueError(f'max_new_tokens={max_new_tokens} does not fit after {prompt_rows} prompt rows')
     frames = torch.zeros((capacity, prompt.shape[1]), dtype=torch.long, device=tower.device)
     frames[:prompt_rows] = prompt.to(tower.device)
@@ -160,11 +335,11 @@ def generate_drama3_graphed(model, prompt, *, graphs, max_new_tokens, temperatur
                           frames[start:paired_end], frames[start + 1: paired_end + 1])
     logger.info(f'Drama 3 prefill: {prompt_rows} rows in {time.perf_counter() - started:.2f}s')
 
-    graphs.start(hidden[-1:], prompt_rows - 1, frames[:prompt_rows], temperature, top_k, top_p)
+    graphs.tower.start(hidden[-1:], prompt_rows - 1, frames[:prompt_rows], temperature, top_k, top_p)
     produced, finish_reason = 0, 'length'
     for step in tqdm(range(max_new_tokens)):
         position = prompt_rows - 1 + step
-        sampled, main, embeddings = graphs.step(position)
+        sampled, main, embeddings = graphs.tower.step(position)
         if main == model.config.eos_token_id:
             finish_reason = 'eos'
             break
@@ -173,9 +348,11 @@ def generate_drama3_graphed(model, prompt, *, graphs, max_new_tokens, temperatur
         if frame_callback is not None and produced % stream_interval == 0:
             frame_callback(frames[prompt_rows: prompt_rows + produced].cpu())
         if step + 1 < max_new_tokens:
-            hidden = backbone(inputs_embeds=embeddings[None],
-                              input_pos=positions[position + 1: position + 2])[0].to(tower.device)
-            graphs.advance(hidden, sampled)
+            if graphs.backbone is not None:
+                hidden = graphs.backbone.step(embeddings, position + 1)
+            else:
+                hidden = backbone(inputs_embeds=embeddings, input_pos=positions[position + 1: position + 2])
+            graphs.tower.advance(hidden[0].to(tower.device), sampled)
     result = frames[prompt_rows: prompt_rows + produced].cpu()
     if frame_callback is not None and produced % stream_interval:
         frame_callback(result)

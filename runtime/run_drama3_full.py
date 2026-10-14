@@ -40,7 +40,7 @@ from fish_speech.models.dac.inference import load_model as load_codec
 from fish_speech.models.dac.modded_dac import WindowLimitedTransformer
 from fish_speech.models.text2semantic.fish_omni.chunking import Drama3History, PROTECTED_SPAN, parse_speaker_segments, split_drama3_text
 from fish_speech.models.text2semantic.fish_omni.generate import Drama3PromptTooLongError, build_drama3_prompt, generate_drama3
-from drama3_generate import TowerDecodeGraphs, generate_drama3_graphed
+from drama3_generate import DecodeGraphs, generate_drama3_graphed
 
 
 FRAMES_PER_SECOND = 44100 / 2048  # Drama 3 codec: 44.1 kHz audio, 2048 samples per frame
@@ -158,6 +158,9 @@ def build_speaker_prompt(chunk, tokenizer, config, voices):
         [torch.from_numpy(ref['codes']).long() for ref in references])
 
 
+# Fast mode reads the prompt in 512-row chunks instead of 32. Each chunk routes to most of every layer's
+# experts, all copied from RAM: 32-row chunks moved about 180 GB over PCIe for a 400-row prompt.
+FAST_PREFILL_ROWS = 512
 CODEC_RESERVE_GIB = 3.0  # codec beside the model: 1.6 GB of weights + up to 0.95 GB while encoding
 
 
@@ -194,7 +197,7 @@ def load_state(budget):
     # reference it meets is encoded exactly as a one-job process would, and every later job with
     # that reference reuses those codes. Its takes then match the one-job mode bit for bit.
     model = load_offloaded_model(checkpoint, gpu_budget_gib=budget - CODEC_RESERVE_GIB)
-    graphs = TowerDecodeGraphs.build(model)  # before any seed: capturing runs the sampler
+    graphs = DecodeGraphs.build(model)  # before any seed: capturing runs the sampler
     return {'checkpoint': checkpoint, 'revision': revision, 'codec': codec, 'model': model, 'references': {},
             'graphs': graphs}
 
@@ -245,7 +248,7 @@ def run_job(job, output, budget, state=None):
     else:
         emit(stage='Loading original FP8 model (most of it into RAM)', progress=.06)
         model = load_offloaded_model(checkpoint, gpu_budget_gib=budget - (CODEC_RESERVE_GIB if streaming else 0))
-        graphs = TowerDecodeGraphs.build(model)  # before any seed: capturing runs the sampler
+        graphs = DecodeGraphs.build(model)  # before any seed: capturing runs the sampler
         pool_before = {}
     loaded = time.perf_counter()
     text = job['text']
@@ -305,8 +308,9 @@ def run_job(job, output, budget, state=None):
             sampling = dict(max_new_tokens=limit, prefill_chunk_size=32, temperature=job.get('temperature', .7),
                             top_p=job.get('top_p', .7), top_k=job.get('top_k', 30),
                             frame_callback=preview if streaming else report, stream_interval=64 if streaming else 16)
-            if graphs is not None and len(prompt) + limit <= graphs.capacity:
-                frames, finish = generate_drama3_graphed(model, prompt, graphs=graphs, **sampling)
+            if graphs is not None and graphs.fits(len(prompt) + limit):
+                frames, finish = generate_drama3_graphed(model, prompt, graphs=graphs,
+                                                         **(sampling | {'prefill_chunk_size': FAST_PREFILL_ROWS}))
             else:
                 frames, finish = generate_drama3(model, prompt, **sampling)
             if not len(frames):

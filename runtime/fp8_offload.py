@@ -58,7 +58,8 @@ class ExpertStagingPool:
 
     The top-k GPU-to-CPU read waits for preceding work on the current stream.
     That also protects pinned source memory from reuse before its copy completes.
-    CUDA graphs and concurrent requests must not use this experiment.
+    It reads the router on the CPU, so it runs between CUDA graphs, never inside one
+    (drama3_generate.BackboneGraphs calls it between pieces); concurrent requests must not share it.
     """
     def __init__(self, device="cuda:0"):
         self.device = torch.device(device)

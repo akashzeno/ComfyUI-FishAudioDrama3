@@ -12,6 +12,8 @@ weights**, on a **16 GB GPU**.
 - **Fits a 16 GB card.** About 7 GB of the model stays on the GPU; the routed experts (30 GB) are
   locked in system RAM and only the ones each step picks are copied over, with the most recently
   used kept in a GPU cache. Same weights, same maths — nothing is re-quantised.
+- **Fast.** With the model loaded, an 8-second line generates in about 14 seconds: each decoding
+  step is replayed from CUDA graphs, even with the experts streaming from RAM.
 - **Keeps the model loaded between runs.** The first run of a session loads it (about 2 min);
   later runs start generating at once. It hands the GPU back on its own the moment ComfyUI loads any
   other model, after an idle period, or when you press *Free memory*.
@@ -109,7 +111,7 @@ What we learned the hard way:
 | `streaming` | off | Decode and play blocks while generating (uses more VRAM) |
 | `keep_loaded` | on | Keep the model loaded between runs |
 | `idle_unload_minutes` | 10 | Unload the kept model after this long without a run |
-| `cuda_graphs` | on | Replay decoding steps from CUDA graphs (faster). Takes repeat exactly, but differ slightly from takes made with it off |
+| `fast_mode` | on | CUDA graphs and larger prompt chunks (about 5× faster). Takes repeat exactly, but differ slightly from takes made with it off |
 | `release_comfy_models` | on | Unload ComfyUI's models before loading Drama 3 |
 | `runtime_folder` | blank | Blank: ComfyUI's Python. A folder made by `install.ps1`: that isolated environment |
 
@@ -135,11 +137,22 @@ What we learned the hard way:
 - **Giving the GPU back.** ComfyUI can't see memory used by another process, so the node wraps
   `load_models_gpu` and `unload_all_models`: before any other model loads onto the GPU, the Drama 3
   process is asked to exit.
-- **CUDA graphs for the audio decoder.** Each audio frame runs the audio decoder (the "tower"):
-  about 1,000 small GPU kernels. They are captured once as CUDA graphs and replayed as one launch.
-  This is Fish Speech's own graph code path — attention over padded cache lengths, sampling settings
-  held on the GPU — so the same seed gives the same take every time, but not the exact take that
-  `cuda_graphs` off gives. Switch it off to reproduce older takes.
+- **Fast mode: CUDA graphs around the expert fetches.** Decoding one audio frame launches about
+  6,800 small GPU kernels, and launching them costs more than running them. Fish Speech captures a
+  whole decode step as CUDA graphs, but with streamed experts a step has to stop at every layer:
+  the CPU reads which experts the router picked and copies the missing ones into the cache. So the
+  step is captured in pieces — the audio decoder, and the backbone cut at each layer's router.
+  Between pieces the CPU fetches that layer's experts; each piece (those experts, then the next
+  layer's attention and router) is one graph launch. A step becomes 42 launches instead of 6,800.
+- **Fast mode: larger prompt chunks.** Before generating, the model reads the whole prompt —
+  reference clip and text — in chunks. Each chunk routes to most of every layer's 256 experts, all
+  copied from RAM, so 32-row chunks moved about 180 GB over PCIe for one line. Fast mode reads
+  512 rows at a time: prefill drops from 14 s to about 2 s.
+- **What fast mode changes.** The graphs follow Fish Speech's own graph code path (attention over
+  padded cache lengths, sampling settings held on the GPU), and larger chunks round differently. The
+  same seed gives the same take every time, but not the exact take that `fast_mode` off gives; off
+  reproduces the original integration bit for bit. Measured on three seeds of one line: same words,
+  same voice match, same pitch range and pace as the original path.
 - **Same output as a fresh process.** The first audio-codec encode in any process takes slightly
   different floating-point paths than every later one. The kept-loaded process encodes each reference
   once and reuses those codes, so its takes match a fresh process bit for bit (checked on an RTX 5080).
@@ -149,17 +162,18 @@ What we learned the hard way:
 | | |
 |---|---|
 | Loading codec + model (and locking the experts in RAM) | about 2 min, once per session with `keep_loaded` |
-| Generation per audio frame (~21.5 frames per second of audio) | 0.30 s with `cuda_graphs`, 0.44 s without |
-| A 7.4 s line, model already loaded, `cuda_graphs` off | about 70 s (generation 65–75 s) |
+| An 8 s line, model already loaded | **about 14 s** (prefill 2 s, decoding 0.07 s per frame) |
+| The same line with `fast_mode` off | about 70 s (prefill 14 s, decoding 0.3 s per frame) |
 | The same line in the original integration, loading per run | 203 s (generation 92 s) |
-| Peak memory | about 12.4 GB VRAM (11.7 without `cuda_graphs`), 31 GB RAM (30 GB of it pinned experts) |
+| Peak memory | about 12.3 GB VRAM, 31 GB RAM (30 GB of it pinned experts) |
 
-Every speed-up except `cuda_graphs` was checked to give **bit-identical audio** to the original
-integration on the same seed; `cuda_graphs` takes were checked for repeatability, words and voice.
+Every speed-up but fast mode was checked to give **bit-identical audio** to the original
+integration on the same seed. Fast mode's backbone graphs are checked bit for bit against Fish's
+eager code at the same padded lengths (`tests/test_backbone_graphs.py`), and its takes for
+repeatability, words, voice and pitch.
 
-What remains is the backbone's kernel-launch overhead. Each step stops at every layer to learn which
-experts to fetch, so the CPU cannot queue GPU work ahead, and one CUDA graph cannot span those stops.
-Capturing the pieces between the stops is the next step.
+What remains is mostly copying experts the GPU cache doesn't hold — about half of each step's — over
+PCIe, and the CPU stop at each layer to pick them.
 
 ## Troubleshooting
 
@@ -184,10 +198,11 @@ $env:DRAMA3_STATE = "$PWD\local"; $env:PYTHONPATH = "$PWD\runtime"
 python tests\test_progress.py
 python tests\test_speaker_dialogue.py
 python tests\test_expert_cache.py
+python tests\test_backbone_graphs.py   # needs an FP8 GPU
 ```
 
-The speed work is also checked end to end on the GPU: the same request and seed must give
-bit-identical audio before and after each change.
+The speed work is also checked end to end on the GPU: with `fast_mode` off, the same request and
+seed must give bit-identical audio before and after each change.
 
 ## Credits and licence
 
