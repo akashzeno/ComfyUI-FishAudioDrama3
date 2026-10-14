@@ -264,12 +264,57 @@ class BackboneGraphs:
         return self.output
 
 
+class PromptState:
+    """What reading a prompt leaves in the caches, kept so the next take of that prompt can skip it.
+
+    The takes of a job read the same prompt. Prefill writes the prompt's rows of the backbone's and
+    the audio decoder's attention caches and the linear-attention layers' running state; decoding
+    only writes past the prompt. Restoring these equals reading the prompt again, whatever ran in
+    between (tests/test_prompt_reuse.py), and saves the prefill: about 2 s per take.
+    """
+
+    def __init__(self, backbone, tower, key, chunk, rows, hidden, copies):
+        self.backbone, self.tower, self.key, self.chunk, self.rows = backbone, tower, key, chunk, rows
+        self.hidden, self.copies = hidden, copies
+
+    @staticmethod
+    def targets(backbone, tower, rows):
+        """The cache regions prefill writes for a prompt of rows rows."""
+        for layer in backbone.model.layers:
+            if layer.layer_type == 'full_attention':
+                yield layer.self_attn.k_cache[:, :, :rows]
+                yield layer.self_attn.v_cache[:, :, :rows]
+            else:
+                yield layer.linear_attn.conv_state
+                yield layer.linear_attn.recurrent_state
+        if tower is not None:  # row p of the tower is labelled with frame p + 1: the last row is decode's
+            for layer in (*tower.shared_layers, *tower.residual_layers):
+                yield layer.transformer_layer.attention.k_cache[:, :, :rows - 1]
+                yield layer.transformer_layer.attention.v_cache[:, :, :rows - 1]
+
+    @classmethod
+    def capture(cls, backbone, tower, *, key, chunk, rows, hidden):
+        """Copy the state right after prefilling the prompt key (in chunks of chunk rows)."""
+        copies = [target.clone() for target in cls.targets(backbone, tower, rows)]
+        return cls(backbone, tower, key.clone(), chunk, rows, hidden.clone(), copies)
+
+    def matches(self, key, chunk):
+        return chunk == self.chunk and key.shape == self.key.shape and torch.equal(key, self.key)
+
+    def restore(self):
+        """Put the prompt's state back; returns the prompt's last hidden row."""
+        for target, copy in zip(self.targets(self.backbone, self.tower, self.rows), self.copies):
+            target.copy_(copy)
+        return self.hidden
+
+
 class DecodeGraphs:
     """The audio decoder's and, when possible, the backbone's decode-step graphs for one model."""
 
     def __init__(self, model, tower, backbone, capacity):
         self.model, self.tower, self.backbone, self.capacity = model, tower, backbone, capacity
         self.cache_rows = model.cache_capacity
+        self.prompt_state = None  # the last prompt read, for the next take of the same prompt
 
     @classmethod
     @torch.inference_mode()
@@ -309,7 +354,8 @@ def generate_drama3_graphed(model, prompt, *, graphs, max_new_tokens, temperatur
                             prefill_chunk_size, frame_callback=None, stream_interval=64):
     """Fish's generate_drama3 with the decode step replayed from CUDA graphs.
 
-    Prefill is unchanged. Returns CPU [frames, 1 + N] without EOS, and the finish reason.
+    Prefill is unchanged, and skipped when the previous take read the same prompt (PromptState).
+    Returns CPU [frames, 1 + N] without EOS, and the finish reason.
     """
     if top_k < 1:
         raise InvalidInputError(f'top_k must be at least 1; got {top_k}')
@@ -323,19 +369,28 @@ def generate_drama3_graphed(model, prompt, *, graphs, max_new_tokens, temperatur
     positions = torch.arange(capacity, device=tower.device)
 
     started = time.perf_counter()
-    for start in range(0, prompt_rows, prefill_chunk_size):
-        end = min(start + prefill_chunk_size, prompt_rows)
-        chunk = frames[start:end]
-        embeddings = tower.embed_backbone(chunk, backbone.embed(chunk[:, 0]))
-        hidden = backbone(inputs_embeds=embeddings[None], input_pos=positions[start:end])
-        hidden = hidden[0].to(tower.device)
-        paired_end = min(end, prompt_rows - 1)
-        if paired_end > start:
-            tower.prefill(hidden[: paired_end - start], positions[start:paired_end],
-                          frames[start:paired_end], frames[start + 1: paired_end + 1])
-    logger.info(f'Drama 3 prefill: {prompt_rows} rows in {time.perf_counter() - started:.2f}s')
+    state = graphs.prompt_state
+    if state is not None and state.matches(prompt, prefill_chunk_size):
+        last = state.restore()
+        logger.info(f'Drama 3 prefill: {prompt_rows} rows restored from the previous take')
+    else:
+        graphs.prompt_state = None  # free the old copies before reading the new prompt
+        for start in range(0, prompt_rows, prefill_chunk_size):
+            end = min(start + prefill_chunk_size, prompt_rows)
+            chunk = frames[start:end]
+            embeddings = tower.embed_backbone(chunk, backbone.embed(chunk[:, 0]))
+            hidden = backbone(inputs_embeds=embeddings[None], input_pos=positions[start:end])
+            hidden = hidden[0].to(tower.device)
+            paired_end = min(end, prompt_rows - 1)
+            if paired_end > start:
+                tower.prefill(hidden[: paired_end - start], positions[start:paired_end],
+                              frames[start:paired_end], frames[start + 1: paired_end + 1])
+        last = hidden[-1:]
+        graphs.prompt_state = PromptState.capture(backbone, tower, key=prompt, chunk=prefill_chunk_size,
+                                                  rows=prompt_rows, hidden=last)
+        logger.info(f'Drama 3 prefill: {prompt_rows} rows in {time.perf_counter() - started:.2f}s')
 
-    graphs.tower.start(hidden[-1:], prompt_rows - 1, frames[:prompt_rows], temperature, top_k, top_p)
+    graphs.tower.start(last, prompt_rows - 1, frames[:prompt_rows], temperature, top_k, top_p)
     produced, finish_reason = 0, 'length'
     for step in tqdm(range(max_new_tokens)):
         position = prompt_rows - 1 + step

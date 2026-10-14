@@ -148,6 +148,10 @@ What we learned the hard way:
   reference clip and text — in chunks. Each chunk routes to most of every layer's 256 experts, all
   copied from RAM, so 32-row chunks moved about 180 GB over PCIe for one line. Fast mode reads
   512 rows at a time: prefill drops from 14 s to about 2 s.
+- **The prompt is read once per job.** Every take of a job reads the same prompt, so after the
+  first take the state it leaves (the prompt's rows in the attention caches, the linear-attention
+  layers' running state) is saved, and later takes restore it instead of reading the prompt again.
+  Bit-identical to reading it again (`tests/test_prompt_reuse.py`, and checked on three real takes).
 - **What fast mode changes.** The graphs follow Fish Speech's own graph code path (attention over
   padded cache lengths, sampling settings held on the GPU), and larger chunks round differently. The
   same seed gives the same take every time, but not the exact take that `fast_mode` off gives; off
@@ -163,6 +167,7 @@ What we learned the hard way:
 |---|---|
 | Loading codec + model (and locking the experts in RAM) | about 2 min, once per session with `keep_loaded` |
 | An 8 s line, model already loaded | **about 14 s** (prefill 2 s, decoding 0.07 s per frame) |
+| Three takes of it (`variations` 3) | **about 40 s** (the prompt is read once) |
 | The same line with `fast_mode` off | about 70 s (prefill 14 s, decoding 0.3 s per frame) |
 | The same line in the original integration, loading per run | 203 s (generation 92 s) |
 | Peak memory | about 12.3 GB VRAM, 31 GB RAM (30 GB of it pinned experts) |
@@ -173,7 +178,10 @@ eager code at the same padded lengths (`tests/test_backbone_graphs.py`), and its
 repeatability, words, voice and pitch.
 
 What remains is mostly copying experts the GPU cache doesn't hold — about half of each step's — over
-PCIe, and the CPU stop at each layer to pick them.
+PCIe, and the CPU stop at each layer to pick them. Replaying recorded routing through other caches:
+a frequency-based eviction rule hits 49% where least-recently-used hits 48%, and 32 slots per layer
+instead of 20 would hit 55% for 1.4 GB more VRAM (about 8% faster decoding). A PCIe ×16 link would
+halve the copying time.
 
 ## Troubleshooting
 
@@ -199,6 +207,7 @@ python tests\test_progress.py
 python tests\test_speaker_dialogue.py
 python tests\test_expert_cache.py
 python tests\test_backbone_graphs.py   # needs an FP8 GPU
+python tests\test_prompt_reuse.py      # needs an FP8 GPU
 ```
 
 The speed work is also checked end to end on the GPU: with `fast_mode` off, the same request and

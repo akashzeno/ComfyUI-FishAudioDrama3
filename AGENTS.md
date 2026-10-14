@@ -67,7 +67,7 @@ The pack started from [Nebuluss/Drama-3](https://github.com/Nebuluss/Drama-3) (g
 | `setup_comfyenv.py` | Setup: fetches Fish Speech at the pinned commit, applies the patch, records the weights folder. `--download` gets the weights; `--verify` hash-checks weights downloaded some other way |
 | `runtime/run_drama3_full.py` | The job runner, run as a child process. Builds prompts, chunks text, encodes references (with a cache), generates and decodes. `--serve` turns it into the persistent worker |
 | `runtime/fp8_offload.py` | Loads the model with its experts in pinned RAM. `ExpertCache` is the per-layer GPU cache, least recently used evicted first; `ExpertStagingPool` copies experts to the GPU |
-| `runtime/drama3_generate.py` | Fast mode: `TowerGraphs` (the audio decoder), `BackboneGraphs` (the backbone in pieces between expert fetches), `DecodeGraphs`, and `generate_drama3_graphed` |
+| `runtime/drama3_generate.py` | Fast mode: `TowerGraphs` (the audio decoder), `BackboneGraphs` (the backbone in pieces between expert fetches), `DecodeGraphs`, `PromptState` (the prompt read once per job), and `generate_drama3_graphed` |
 | `runtime/selfcheck.py` | Checks Fish's FP8 kernels on this GPU against full-precision maths |
 | `runtime/streaming.patch` | The only change to Fish Speech: a frame callback for progress and preview |
 | `take_io.py` and `runtime/take_io.py` | Identical copies (the node and the runner import them separately). Keep them identical |
@@ -101,6 +101,7 @@ python tests\test_progress.py
 python tests\test_speaker_dialogue.py
 python tests\test_expert_cache.py
 python tests\test_backbone_graphs.py   # needs an FP8 GPU (SM 8.9+)
+python tests\test_prompt_reuse.py      # needs an FP8 GPU (SM 8.9+)
 ```
 
 Run every test file before you commit. They are plain `unittest` files, one process each.
@@ -148,6 +149,11 @@ Read this before optimising anything.
 - **Larger prompt chunks.** The prompt is read in 512-row chunks (`FAST_PREFILL_ROWS`) instead of
   32-row ones. Each chunk copies most of every layer's experts, so small chunks moved about 180 GB
   over PCIe for one line.
+- **The prompt is read once per job** (`PromptState`). After a take's prefill, the prompt's rows
+  of the backbone's and the audio decoder's attention caches and the linear-attention layers'
+  running state are copied; the next take of the same prompt (and chunk size) restores them instead
+  of prefilling. Decoding only writes past the prompt's rows, so this is bit-identical, whatever ran
+  in between. Saves about 2 s per take.
 
 Fast-mode takes repeat exactly for a given seed. They do **not** match fast mode off: the graphs
 use Fish's padded-length numerics, and larger chunks round differently.
@@ -157,11 +163,25 @@ loaded:
 
 | Path | Generation time |
 |---|---|
-| `fast_mode` on | about 14 s |
+| `fast_mode` on | about 14 s (3 takes: about 40 s) |
 | `fast_mode` off | about 70 s |
 | Original integration | 92 s |
 
 Peak VRAM is 12.3 GB.
+
+**Where the time goes now** (fast mode, 0.066 s per frame): about 40 ms copying the experts the
+cache misses (about 4.5 of 8 per layer, 0.5 GB per frame at 13 GB/s), the rest GPU work and the
+40 CPU stops. Already measured, so don't redo them without new information:
+
+- *Eviction rules.* Replaying 1,947 recorded frames: least-recently-used hits 47.8% at 20 slots
+  per layer, a decaying frequency count 48.7%, uneven slots per layer 48.0%; the unreachable
+  optimum is 62.4%.
+- *More cache.* 32 slots per layer hit 54.9%: about 8% faster decoding for 1.4 GB more VRAM,
+  which would have to come out of the node's 2.5 GB safety margin.
+- *Hardware.* The 5080 runs PCIe 4.0 ×8 because the second GPU takes the other 8 lanes; the owner
+  keeps both cards where they are.
+- *Not worth it:* re-quantising experts (changes the weights), faster GPU kernels (GPU work is a
+  small share), the RTX 3060 as expert memory (no FP8 there, no peer copies on GeForce).
 
 ## Verification
 
@@ -172,6 +192,8 @@ Peak VRAM is 12.3 GB.
 - **Changes that touch fast mode:**
   - `tests/test_backbone_graphs.py` must stay bit-identical. It compares against Fish's eager
     backbone at the same padded length, with all layers streamed, some streamed, and none.
+  - `tests/test_prompt_reuse.py` must pass, and a 3-take job must give the same three takes with
+    and without the prompt reuse.
   - End to end, job 2 must equal job 1.
   - Compare quality against the off path on at least three seeds: transcript, voice match, pitch
     range and pace. One take per side shows only seed-to-seed variation, not a quality difference.
