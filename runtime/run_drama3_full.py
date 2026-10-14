@@ -39,6 +39,34 @@ from fish_speech.models.text2semantic.fish_omni.chunking import Drama3History, P
 from fish_speech.models.text2semantic.fish_omni.generate import Drama3PromptTooLongError, build_drama3_prompt, generate_drama3
 
 
+FRAMES_PER_SECOND = 44100 / 2048  # Drama 3 codec: 44.1 kHz audio, 2048 samples per frame
+FRAMES_PER_CHAR = 1.43            # measured: 112 spoken characters -> 160 frames
+SOUND_SECONDS = .9                # rough length of one [sound] or [pause]
+SOUND_WORDS = ('pause', 'laugh', 'sigh', 'breath', 'chuckle', 'giggle', 'gasp', 'cough', 'sniff', 'sob', 'cry', 'hum')
+BRACKETS = re.compile(r'\[([^\]]*)\]')
+ANGLE_TAGS = re.compile(r'<[^>]*>')
+
+
+def estimate_frames(text):
+    """Rough frame count of a part, used only to move the progress bar.
+
+    Directions and word tags are not spoken; a short bracket naming a sound or pause is.
+    """
+    sounds = sum(1 for inner in BRACKETS.findall(text)
+                 if len(inner.split()) <= 4 and any(word in inner.lower() for word in SOUND_WORDS))
+    spoken = ' '.join(ANGLE_TAGS.sub('', BRACKETS.sub('', text)).split())
+    return FRAMES_PER_CHAR * len(spoken) + sounds * SOUND_SECONDS * FRAMES_PER_SECOND
+
+
+def generation_progress(variation, variants, part, parts, frames, estimate):
+    """Overall progress while generating: 15 % (model loaded) to 95 % (saving).
+
+    A part that runs past its estimate holds just short of the next part.
+    """
+    done = min(frames / max(estimate, 1.), .97)
+    return .15 + .80 * (variation * parts + part + done) / (variants * parts)
+
+
 def encode_reference(path, codec):
     samples, rate = sf.read(path, dtype='float32', always_2d=True)
     if not len(samples) or not np.isfinite(samples).all():
@@ -134,7 +162,7 @@ def run_job(job, output, budget):
     streaming = job.get('streaming', False)
     codec = None
     if refs or (job.get('previous_audio') and job.get('use_history', True)) or streaming:
-        emit(stage='Encoding references / loading audio codec')
+        emit(stage='Encoding references / loading audio codec', progress=.02)
         codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu').cuda()
     replaced = {ref['speaker_id'] for ref in refs}
     voices = [ref for ref in previous['voices'] if ref['speaker_id'] not in replaced]
@@ -150,7 +178,7 @@ def run_job(job, output, budget):
         gc.collect()
         torch.cuda.empty_cache()
     encoded = time.perf_counter()
-    emit(stage='Loading original FP8 model')
+    emit(stage='Loading original FP8 model (most of it into RAM)', progress=.06)
     model = load_offloaded_model(checkpoint, gpu_budget_gib=budget - (3.5 if streaming else 0))
     loaded = time.perf_counter()
     text = job['text']
@@ -175,7 +203,9 @@ def run_job(job, output, budget):
                 history.push(turn['text'], torch.from_numpy(turn['codes']).long())
         turns, samples, finishes = [], [], []
         for index, chunk in enumerate(chunks):
-            emit(stage=f'Take {variation+1}/{variants} - part {index+1}/{len(chunks)}', progress=(variation*len(chunks)+index)/(variants*len(chunks)))
+            estimate = estimate_frames(chunk)
+            emit(stage=f'Take {variation+1}/{variants} - part {index+1}/{len(chunks)} - starting',
+                 progress=generation_progress(variation, variants, index, len(chunks), 0, estimate))
             for candidates in ([()] if mode == 'speakers' else history.candidates()):
                 try:
                     prompt = (build_speaker_prompt(chunk, model.tokenizer, model.config, voices) if mode == 'speakers' else
@@ -196,12 +226,18 @@ def run_job(job, output, budget):
                 part_samples.append(audio)
                 filename = f'preview_{variation}_{index}_{len(part_samples)}.wav'
                 sf.write(output.parent / filename, audio, codec.sample_rate, subtype='PCM_16')
-                emit(stage=f'Take {variation+1} - part {index+1} - {len(frames)} frames', audio=filename, variation=variation)
+                emit(stage=f'Take {variation+1} - part {index+1} - {len(frames)} frames', audio=filename, variation=variation,
+                     progress=generation_progress(variation, variants, index, len(chunks), len(frames), estimate))
+
+            def report(frames):
+                emit(stage=f'Take {variation+1}/{variants} - part {index+1}/{len(chunks)} - '
+                           f'{len(frames) / FRAMES_PER_SECOND:.1f} s of audio so far',
+                     progress=generation_progress(variation, variants, index, len(chunks), len(frames), estimate))
 
             limit = job.get('max_frames', 0) or (600 if len(chunks) > 1 else 2048)
             frames, finish = generate_drama3(model, prompt, max_new_tokens=limit, prefill_chunk_size=32,
                 temperature=job.get('temperature', .7), top_p=job.get('top_p', .7), top_k=job.get('top_k', 30),
-                frame_callback=preview if streaming else None, stream_interval=64)
+                frame_callback=preview if streaming else report, stream_interval=64 if streaming else 16)
             if not len(frames):
                 raise RuntimeError(f'No audio frames produced for part {index+1}.')
             codes = frames[:, 1:].T.contiguous().numpy().astype(np.int16)
@@ -223,7 +259,7 @@ def run_job(job, output, budget):
     del model
     gc.collect()
     torch.cuda.empty_cache()
-    emit(stage='Saving audio and reusable takes')
+    emit(stage='Saving audio and reusable takes', progress=.96)
     if codec is None:
         codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu').cuda()
     files = []
