@@ -1,11 +1,13 @@
 """Full local Drama 3 job runtime; models are reused across chunks and variations."""
 import argparse
 import gc
+import hashlib
 import json
 import os
 import re
 import sys
 import time
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -67,11 +69,24 @@ def generation_progress(variation, variants, part, parts, frames, estimate):
     return .15 + .80 * (variation * parts + part + done) / (variants * parts)
 
 
-def encode_reference(path, codec):
+def encode_reference(path, codec, cache=None):
+    """Encode a reference clip. With a cache (persistent worker), each distinct clip is encoded once."""
     samples, rate = sf.read(path, dtype='float32', always_2d=True)
     if not len(samples) or not np.isfinite(samples).all():
         raise ValueError('Reference audio must contain finite audio samples.')
-    wave = torch.from_numpy(samples.mean(axis=1)).unsqueeze(0)
+    key = None
+    if cache is not None:
+        key = hashlib.sha1(np.ascontiguousarray(samples).tobytes() + str(rate).encode()).hexdigest()
+        if key in cache:
+            return cache[key]
+    codes = encode_samples(samples.mean(axis=1), rate, codec)
+    if cache is not None:
+        cache[key] = codes
+    return codes
+
+
+def encode_samples(mono, rate, codec):
+    wave = torch.from_numpy(np.ascontiguousarray(mono, dtype=np.float32)).unsqueeze(0)
     wave = torchaudio.functional.resample(wave, rate, codec.sample_rate)
     with torch.inference_mode():
         audio = wave.unsqueeze(0).cuda()
@@ -141,11 +156,36 @@ def build_speaker_prompt(chunk, tokenizer, config, voices):
         [torch.from_numpy(ref['codes']).long() for ref in references])
 
 
-def run_job(job, output, budget):
+CODEC_RESERVE_GIB = 3.5  # VRAM kept free for the codec beside the model (as streaming already did)
+
+
+def checkpoint_info():
+    checkpoint = Path(json.loads((STATE / 'model-location.json').read_text(encoding='utf-8-sig'))['checkpoint_dir'])
+    return checkpoint, (checkpoint / 'revision.txt').read_text().strip()
+
+
+def load_state(budget):
+    """Load the codec and the model once, for a persistent worker.
+
+    The codec stays on the GPU beside the model, so the model's budget leaves CODEC_RESERVE_GIB free.
+    That only moves the split between resident and staged experts, which compute the same values.
+    """
+    checkpoint, revision = checkpoint_info()
+    codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu').cuda()
+    # The first encode in a process takes slightly different floating-point paths than every later
+    # one (equally accurate: the same reconstruction error, but different codes). A one-job process
+    # always encodes its reference first, so the worker caches each reference's codes: the first
+    # reference it meets is encoded exactly as a one-job process would, and every later job with
+    # that reference reuses those codes. Its takes then match the one-job mode bit for bit.
+    model = load_offloaded_model(checkpoint, gpu_budget_gib=budget - CODEC_RESERVE_GIB)
+    return {'checkpoint': checkpoint, 'revision': revision, 'codec': codec, 'model': model, 'references': {}}
+
+
+def run_job(job, output, budget, state=None):
+    """One job. With state (a persistent worker) the loaded model and codec are reused and kept."""
     output.parent.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
-    checkpoint = Path(json.loads((STATE / 'model-location.json').read_text(encoding='utf-8-sig'))['checkpoint_dir'])
-    revision = (checkpoint / 'revision.txt').read_text().strip()
+    checkpoint, revision = (state['checkpoint'], state['revision']) if state else checkpoint_info()
     events = output.parent / 'events.jsonl'
     events.write_text('', encoding='utf-8')
 
@@ -160,26 +200,33 @@ def run_job(job, output, budget):
     if previous.get('revision', revision) != revision:
         raise ValueError('The previous take belongs to another checkpoint revision.')
     streaming = job.get('streaming', False)
-    codec = None
+    codec = state['codec'] if state else None
     if refs or (job.get('previous_audio') and job.get('use_history', True)) or streaming:
-        emit(stage='Encoding references / loading audio codec', progress=.02)
-        codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu').cuda()
+        emit(stage='Encoding references' if state else 'Encoding references / loading audio codec', progress=.02)
+        if codec is None:
+            codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu').cuda()
     replaced = {ref['speaker_id'] for ref in refs}
     voices = [ref for ref in previous['voices'] if ref['speaker_id'] not in replaced]
     for ref in refs:
         if not ref['text'].strip():
             raise ValueError('Every reference needs its exact transcript.')
-        voices.append({'text': ref['text'], 'speaker_id': ref['speaker_id'], 'codes': encode_reference(ref['path'], codec)})
+        voices.append({'text': ref['text'], 'speaker_id': ref['speaker_id'],
+                       'codes': encode_reference(ref['path'], codec, state['references'] if state else None)})
     if job.get('previous_audio') and job.get('use_history', True):
         previous['turns'].append({'text': job['previous_text'], 'codes': encode_reference(job['previous_audio'], codec)})
-    if codec is not None and not streaming:
+    if codec is not None and not streaming and not state:
         del codec
         codec = None
         gc.collect()
         torch.cuda.empty_cache()
     encoded = time.perf_counter()
-    emit(stage='Loading original FP8 model (most of it into RAM)', progress=.06)
-    model = load_offloaded_model(checkpoint, gpu_budget_gib=budget - (3.5 if streaming else 0))
+    if state:
+        model = state['model']
+        pool_before = model.offload_pool.stats()
+    else:
+        emit(stage='Loading original FP8 model (most of it into RAM)', progress=.06)
+        model = load_offloaded_model(checkpoint, gpu_budget_gib=budget - (CODEC_RESERVE_GIB if streaming else 0))
+        pool_before = {}
     loaded = time.perf_counter()
     text = job['text']
     mode = job.get('chunk_mode', 'auto')
@@ -250,15 +297,18 @@ def run_job(job, output, budget):
         results.append({'turns': turns, 'samples': samples, 'seed': seed, 'finish_reasons': finishes})
     torch.cuda.synchronize()
     generated = time.perf_counter()
-    stats = model.offload_pool.stats() | {'reference_encode_seconds': encoded-started, 'model_load_seconds': loaded-encoded,
+    pool = {key: value - pool_before.get(key, 0) if key != 'staging_capacity_experts' else value
+            for key, value in model.offload_pool.stats().items()}
+    stats = pool | {'persistent_worker': bool(state), 'reference_encode_seconds': encoded-started, 'model_load_seconds': loaded-encoded,
         'generation_seconds': generated-loaded, 'generation_peak_allocated_GiB': torch.cuda.max_memory_allocated()/2**30,
         'generation_peak_reserved_GiB': torch.cuda.max_memory_reserved()/2**30, 'process_RAM_GiB': psutil.Process().memory_info().rss/2**30,
         'checkpoint_revision': revision, 'reference_count': len(voices), 'parts': len(chunks), 'chunk_mode': mode,
         'part_speakers': [speaker for chunk in chunks for speaker, _ in parse_speaker_segments(chunk)],
         'streaming': streaming, 'text': job['text']}
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
+    if not state:
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
     emit(stage='Saving audio and reusable takes', progress=.96)
     if codec is None:
         codec = load_codec('modded_dac_vq', str(checkpoint / 'codec.pth'), device='cpu').cuda()
@@ -282,6 +332,45 @@ def run_job(job, output, budget):
     print(json.dumps(stats, indent=2), flush=True)
 
 
+def serve(server_dir, budget, idle_seconds, parent_pid=None):
+    """Persistent worker: load once, run queued jobs, exit when idle, asked to stop, or ComfyUI exits."""
+    import worker_protocol as wp
+    server_dir = Path(server_dir)
+    started = time.perf_counter()
+    print('[Drama 3 worker] loading the codec and the model ...', flush=True)
+    state = load_state(budget)
+    load_seconds = time.perf_counter() - started
+    wp.mark_ready(server_dir, {'pid': os.getpid(), 'load_seconds': load_seconds, 'gpu_budget': budget})
+    print(f'[Drama 3 worker] ready in {load_seconds:.0f} s; exits after {idle_seconds / 60:.0f} idle minutes', flush=True)
+    last = time.monotonic()
+    while True:
+        if wp.stop_requested(server_dir):
+            reason = 'asked to stop'
+            break
+        if parent_pid and not psutil.pid_exists(parent_pid):
+            reason = 'ComfyUI exited'
+            break
+        claimed = wp.claim_next(server_dir)
+        if claimed is None:
+            if time.monotonic() - last > idle_seconds:
+                reason = f'idle for {idle_seconds / 60:.0f} minutes'
+                break
+            time.sleep(.2)
+            continue
+        job_id, payload = claimed
+        try:
+            job = json.loads(Path(payload['request']).read_text(encoding='utf-8'))
+            run_job(job, Path(payload['output']), budget, state=state)
+            wp.finish(server_dir, job_id, ok=True)
+        except Exception:
+            error = traceback.format_exc()
+            print(error, flush=True)
+            wp.finish(server_dir, job_id, ok=False, error=error)
+        torch.cuda.empty_cache()
+        last = time.monotonic()
+    print(f'[Drama 3 worker] exiting ({reason})', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--request', type=Path)
@@ -295,7 +384,13 @@ def main():
     parser.add_argument('--top-p', type=float, default=.7)
     parser.add_argument('--top-k', type=int, default=30)
     parser.add_argument('--output', type=Path, default=STATE.parent/'outputs/drama3-fp8-test.wav')
+    parser.add_argument('--serve', type=Path, help='Run as a persistent worker serving jobs from this folder.')
+    parser.add_argument('--idle-seconds', type=float, default=600.)
+    parser.add_argument('--parent-pid', type=int)
     args = parser.parse_args()
+    if args.serve:
+        serve(args.serve, args.gpu_budget, args.idle_seconds, args.parent_pid)
+        return
     job = json.loads(args.request.read_text(encoding='utf-8')) if args.request else {
         'text': args.text, 'seed': args.seed, 'max_frames': args.max_frames, 'temperature': args.temperature,
         'top_p': args.top_p, 'top_k': args.top_k, 'voices': [{'path': str(args.reference_audio), 'text': args.reference_text, 'speaker_id': 0}] if args.reference_audio else []}
