@@ -24,6 +24,8 @@ RAM and copied straight to the GPU, with a per-layer GPU cache of recently used 
 audio codec drops three attention masks its modules never read (runtime/fp8_offload.py,
 run_drama3_full.py); in fast mode each decode step is replayed from CUDA graphs built on Fish
 Speech's own graph code path — the audio decoder, and the backbone in pieces between expert
-fetches — the prompt is read in larger chunks, and the state a prompt's prefill leaves is reused
-by later takes of the same prompt (runtime/drama3_generate.py, run_drama3_full.py). The Fish Audio Materials
+fetches — the prompt is read in larger chunks, the state a prompt's prefill leaves is reused by
+later takes of the same prompt, and the next layer's experts are guessed with its own router and
+copied ahead; streamed experts are packed one row per expert (runtime/drama3_generate.py,
+runtime/fp8_offload.py, run_drama3_full.py). The Fish Audio Materials
 themselves are not modified beyond upstream's runtime/streaming.patch.

@@ -12,7 +12,7 @@ weights**, on a **16 GB GPU**.
 - **Fits a 16 GB card.** About 7 GB of the model stays on the GPU; the routed experts (30 GB) are
   locked in system RAM and only the ones each step picks are copied over, with the most recently
   used kept in a GPU cache. Same weights, same maths — nothing is re-quantised.
-- **Fast.** With the model loaded, an 8-second line generates in about 14 seconds: each decoding
+- **Fast.** With the model loaded, an 8-second line generates in about 12 seconds: each decoding
   step is replayed from CUDA graphs, even with the experts streaming from RAM.
 - **Keeps the model loaded between runs.** The first run of a session loads it (about 2 min);
   later runs start generating at once. It hands the GPU back on its own the moment ComfyUI loads any
@@ -111,7 +111,7 @@ What we learned the hard way:
 | `streaming` | off | Decode and play blocks while generating (uses more VRAM) |
 | `keep_loaded` | on | Keep the model loaded between runs |
 | `idle_unload_minutes` | 10 | Unload the kept model after this long without a run |
-| `fast_mode` | on | CUDA graphs and larger prompt chunks (about 5× faster). Takes repeat exactly, but differ slightly from takes made with it off |
+| `fast_mode` | on | CUDA graphs, larger prompt chunks, prefetching (about 6× faster). Takes repeat exactly, but differ slightly from takes made with it off |
 | `release_comfy_models` | on | Unload ComfyUI's models before loading Drama 3 |
 | `runtime_folder` | blank | Blank: ComfyUI's Python. A folder made by `install.ps1`: that isolated environment |
 
@@ -152,6 +152,17 @@ What we learned the hard way:
   first take the state it leaves (the prompt's rows in the attention caches, the linear-attention
   layers' running state) is saved, and later takes restore it instead of reading the prompt again.
   Bit-identical to reading it again (`tests/test_prompt_reuse.py`, and checked on three real takes).
+- **Experts copied ahead of the router.** Each layer's router decides which experts the next step
+  needs, and the missing ones then have to cross PCIe while the GPU waits. Fast mode also runs the
+  *next* layer's router early, on the state the current layer has; it finds about half of the real
+  picks, and the two best guesses not yet cached are copied on a second stream while the GPU
+  computes. About 58% of these guesses are used; wrong ones cost bandwidth, never correctness
+  (the layer waits for its prefetched copies before touching its cache). Decoding: 15 → 16.5
+  frames per second; prefetching 3 per layer measured slower.
+- **One copy per expert.** An expert is four tensors (two weight blocks, two scale tables). In
+  pinned RAM and in the GPU cache they are packed into one row per expert, so a missing expert
+  arrives in one copy instead of four. The FP8 kernel reads the packed rows through strides,
+  bit-identically (`tests/test_backbone_graphs.py`).
 - **What fast mode changes.** The graphs follow Fish Speech's own graph code path (attention over
   padded cache lengths, sampling settings held on the GPU), and larger chunks round differently. The
   same seed gives the same take every time, but not the exact take that `fast_mode` off gives; off
@@ -166,8 +177,8 @@ What we learned the hard way:
 | | |
 |---|---|
 | Loading codec + model (and locking the experts in RAM) | about 2 min, once per session with `keep_loaded` |
-| An 8 s line, model already loaded | **about 14 s** (prefill 2 s, decoding 0.07 s per frame) |
-| Three takes of it (`variations` 3) | **about 40 s** (the prompt is read once) |
+| An 8 s line, model already loaded | **about 12 s** (prefill 2 s, decoding 0.06 s per frame) |
+| Three takes of it (`variations` 3) | **about 35 s** (the prompt is read once) |
 | The same line with `fast_mode` off | about 70 s (prefill 14 s, decoding 0.3 s per frame) |
 | The same line in the original integration, loading per run | 203 s (generation 92 s) |
 | Peak memory | about 12.3 GB VRAM, 31 GB RAM (30 GB of it pinned experts) |
@@ -177,11 +188,11 @@ integration on the same seed. Fast mode's backbone graphs are checked bit for bi
 eager code at the same padded lengths (`tests/test_backbone_graphs.py`), and its takes for
 repeatability, words, voice and pitch.
 
-What remains is mostly copying experts the GPU cache doesn't hold — about half of each step's — over
-PCIe, and the CPU stop at each layer to pick them. Replaying recorded routing through other caches:
-a frequency-based eviction rule hits 49% where least-recently-used hits 48%, and 32 slots per layer
-instead of 20 would hit 55% for 1.4 GB more VRAM (about 8% faster decoding). A PCIe ×16 link would
-halve the copying time.
+What remains is mostly copying the experts the GPU cache doesn't hold over PCIe (about 36 ms of a
+frame's 60), then GPU work (about 12 ms) and the CPU stop at each layer. Replaying recorded routing
+through other caches: a frequency-based eviction rule hits 49% where least-recently-used hits 48%,
+and 32 slots per layer instead of 20 would hit 55% for 1.4 GB more VRAM (about 8% faster decoding).
+A PCIe ×16 link would halve the copying time.
 
 ## Troubleshooting
 

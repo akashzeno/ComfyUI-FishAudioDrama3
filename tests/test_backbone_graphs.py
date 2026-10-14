@@ -17,7 +17,10 @@ from fish_speech.models.text2semantic.fish_omni.backbone import FishOmniBackbone
 from fish_speech.models.text2semantic.fish_omni.config import FishOmniTextConfig
 from fish_speech.models.text2semantic.fish_omni.fp8_moe import fp8_gemm_supported
 from drama3_generate import BackboneGraphs
-from fp8_offload import FIELDS, ExpertCache, ExpertStagingPool, OffloadedFP8Experts, pin_offloaded_experts
+from fish_speech.models.text2semantic.fish_omni.fp8_moe import fp8_moe_forward
+from fish_speech.models.text2semantic.fish_omni.moe import MoEExperts
+from fp8_offload import (FIELDS, ExpertCache, ExpertStagingPool, OffloadedFP8Experts, packed_layout,
+                         packed_views, pin_offloaded_experts)
 
 BUCKETS = (8, 16, 32)
 
@@ -75,7 +78,9 @@ def bucket(position):
 @unittest.skipUnless(torch.cuda.is_available() and fp8_gemm_supported(['cuda:0']), 'needs an FP8-capable GPU')
 class BackboneGraphTests(unittest.TestCase):
     def check_layout(self, streamed):
-        backbone = tiny_backbone(streamed)
+        self.check_layout_on(tiny_backbone(streamed))
+
+    def check_layout_on(self, backbone):
         with torch.inference_mode():
             graphs = BackboneGraphs.build(backbone, BUCKETS)
             self.assertIsNotNone(graphs)
@@ -104,6 +109,13 @@ class BackboneGraphTests(unittest.TestCase):
     def test_all_layers_resident(self):
         self.check_layout(())
 
+    def test_streamed_layers_prefetch_and_stay_exact(self):
+        backbone = tiny_backbone((0, 1, 2, 3))
+        pool = backbone.model.layers[0].mlp.experts.staging_pool
+        self.check_layout_on(backbone)
+        self.assertGreater(pool.experts_prefetched, 0, 'nothing was prefetched')
+        self.assertEqual(pool.prefetch_used + pool.prefetch_wasted, pool.experts_prefetched)
+
     def test_streamed_layers_without_a_cache_are_not_graphed(self):
         backbone = tiny_backbone((1, 3), cache_slots=0)
         with torch.inference_mode():
@@ -119,6 +131,30 @@ class BackboneGraphTests(unittest.TestCase):
             before = pool.cache_hits + pool.cache_misses
             graphs.step(torch.randn((1, 1, 256), dtype=torch.bfloat16, device='cuda'), 5)
         self.assertEqual(pool.cache_hits + pool.cache_misses - before, 4 * 4)  # 4 layers x top 4
+
+
+
+@unittest.skipUnless(torch.cuda.is_available() and fp8_gemm_supported(['cuda:0']), 'needs an FP8-capable GPU')
+class PackedExpertTests(unittest.TestCase):
+    def test_kernel_reads_packed_experts_exactly_like_contiguous_ones(self):
+        torch.manual_seed(0)
+        experts = MoEExperts(16, 256, 128, fp8=True, device='cuda')
+        for name in ('w13_weight', 'w2_weight'):
+            getattr(experts, name).copy_(torch.randn(getattr(experts, name).shape, device='cuda').to(torch.float8_e4m3fn))
+        for name in ('w13_scale_inv', 'w2_scale_inv'):
+            getattr(experts, name).uniform_(0.01, 0.03)
+        layout, size = packed_layout(experts)
+        packed = torch.empty((16, size), dtype=torch.uint8, device='cuda')
+        views = packed_views(packed, experts, layout)
+        for name in FIELDS:
+            views[name].copy_(getattr(experts, name))
+        for tokens in (1, 5):
+            x = torch.randn((tokens, 256), device='cuda').to(torch.bfloat16)
+            ids = torch.stack([torch.randperm(16, device='cuda')[:4] for _ in range(tokens)])
+            weights = torch.rand((tokens, 4), device='cuda').to(torch.bfloat16)
+            contiguous = fp8_moe_forward(x, ids, weights, *(getattr(experts, name) for name in FIELDS))
+            from_packed = fp8_moe_forward(x, ids, weights, *(views[name] for name in FIELDS))
+            self.assertTrue(torch.equal(contiguous, from_packed), f'{tokens} token(s): packed experts differ')
 
 
 if __name__ == '__main__':

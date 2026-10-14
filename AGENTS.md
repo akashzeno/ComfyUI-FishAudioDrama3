@@ -66,7 +66,7 @@ The pack started from [Nebuluss/Drama-3](https://github.com/Nebuluss/Drama-3) (g
 | `log_echo.py` | Echoes the job log (with the frame counter) to ComfyUI's terminal |
 | `setup_comfyenv.py` | Setup: fetches Fish Speech at the pinned commit, applies the patch, records the weights folder. `--download` gets the weights; `--verify` hash-checks weights downloaded some other way |
 | `runtime/run_drama3_full.py` | The job runner, run as a child process. Builds prompts, chunks text, encodes references (with a cache), generates and decodes. `--serve` turns it into the persistent worker |
-| `runtime/fp8_offload.py` | Loads the model with its experts in pinned RAM. `ExpertCache` is the per-layer GPU cache, least recently used evicted first; `ExpertStagingPool` copies experts to the GPU |
+| `runtime/fp8_offload.py` | Loads the model with its experts in pinned RAM, packed one row per expert (`packed_layout`, `packed_views`). `ExpertCache` is the per-layer GPU cache (packed rows, least recently used evicted first); `ExpertStagingPool.place` puts a step's experts in it, `prefetch` copies guessed ones ahead on a side stream, `stage` serves the eager path and prefill |
 | `runtime/drama3_generate.py` | Fast mode: `TowerGraphs` (the audio decoder), `BackboneGraphs` (the backbone in pieces between expert fetches), `DecodeGraphs`, `PromptState` (the prompt read once per job), and `generate_drama3_graphed` |
 | `runtime/selfcheck.py` | Checks Fish's FP8 kernels on this GPU against full-precision maths |
 | `runtime/streaming.patch` | The only change to Fish Speech: a frame callback for progress and preview |
@@ -154,6 +154,15 @@ Read this before optimising anything.
   running state are copied; the next take of the same prompt (and chunk size) restores them instead
   of prefilling. Decoding only writes past the prompt's rows, so this is bit-identical, whatever ran
   in between. Saves about 2 s per take.
+- **Prefetch.** The piece that runs layer N's router also runs layer N+1's router early, on layer
+  N's state after attention (`attend_and_route`); the router's picks and these guesses come back
+  in one copy. After queueing layer N's real misses and the next piece, `BackboneGraphs.step` asks
+  `prefetch` to copy the best `PREFETCH_PER_LAYER` (2) guesses not cached, on a side stream that
+  waits for those misses first. `place` makes the compute stream wait for a layer's prefetch event
+  before it reuses or rewrites any slot of that cache.
+- **Packed experts.** Pinning packs each layer's four expert tensors into one buffer, one row per
+  expert, and the four tensors become views of it; cache rows use the same layout, so a missing
+  expert is one copy. The FP8 kernel takes strides, so views work unchanged.
 
 Fast-mode takes repeat exactly for a given seed. They do **not** match fast mode off: the graphs
 use Fish's padded-length numerics, and larger chunks round differently.
@@ -163,15 +172,22 @@ loaded:
 
 | Path | Generation time |
 |---|---|
-| `fast_mode` on | about 14 s (3 takes: about 40 s) |
+| `fast_mode` on | about 12 s (3 takes: about 35 s) |
 | `fast_mode` off | about 70 s |
 | Original integration | 92 s |
 
 Peak VRAM is 12.3 GB.
 
-**Where the time goes now** (fast mode, 0.066 s per frame): about 40 ms copying the experts the
-cache misses (about 4.5 of 8 per layer, 0.5 GB per frame at 13 GB/s), the rest GPU work and the
-40 CPU stops. Already measured, so don't redo them without new information:
+**Where the time goes now** (fast mode, about 0.06 s per frame; profiled before prefetch): about
+36 ms copying the experts the cache misses (0.22 ms each at 14 GB/s), 12 ms GPU work, the rest
+the 40 CPU stops. Already measured, so don't redo them without new information:
+
+- *Prefetch depth.* The early router finds 53% of the real picks. Simulated on 1,947 recorded
+  frames: 1 per layer 8% faster, 2 per layer 14%, 3 or more slower. On the GPU: 2 per layer took
+  3 takes from 36 s to 34 s (decoding 15 → 16.5 frames/s, 58% of prefetches used); 3 per layer
+  took 38 s.
+- *Pinned host buffers for the router's picks* made no measurable difference on their own; the
+  CPU stop is not dominated by that copy.
 
 - *Eviction rules.* Replaying 1,947 recorded frames: least-recently-used hits 47.8% at 20 slots
   per layer, a decaying frequency count 48.7%, uneven slots per layer 48.0%; the unreachable
@@ -200,6 +216,9 @@ cache misses (about 4.5 of 8 per layer, 0.5 GB per frame at 13 GB/s), the rest G
 - **Speed claims:** give the measured numbers and the hardware. Measure with normal takes:
   repetitive runaway takes make the expert cache look far better than it is (87% hits against the
   real 44%).
+- **Profiling:** PyTorch's profiler exports every `record_function` range twice, as
+  `user_annotation` (CPU) and `gpu_user_annotation`. Filter on the category, or every per-step
+  number comes out halved; that once made PCIe copying look like half its real cost.
 - **Writing a test:** make sure it can fail. Break the code on purpose once and watch the test
   catch it.
 

@@ -39,17 +39,50 @@ def _rows(tensor):
     return tensor.view(torch.uint8) if tensor.dtype == torch.float8_e4m3fn else tensor
 
 
+def packed_layout(experts):
+    """Where each of an expert's four tensors sits when they are stored together in one byte row.
+
+    Returns ([(name, offset, size)], row size). Big weights first; every field starts 16-byte
+    aligned, as the FP8 kernel's loads expect.
+    """
+    layout, offset = [], 0
+    for name in ('w13_weight', 'w2_weight', 'w13_scale_inv', 'w2_scale_inv'):
+        tensor = getattr(experts, name)
+        size = tensor[0].numel() * tensor.element_size()
+        layout.append((name, offset, size))
+        offset += -(-size // 16) * 16
+    return layout, offset
+
+
+def packed_views(buffer, experts, layout):
+    """The four expert tensors as views of a [rows, row size] uint8 buffer, one expert per row.
+
+    The FP8 kernel takes strides, so it reads these views as it reads contiguous tensors.
+    """
+    views = {}
+    for name, offset, size in layout:
+        source = getattr(experts, name)
+        views[name] = buffer[:, offset:offset + size].view(source.dtype).view(len(buffer), *source.shape[1:])
+    return views
+
+
 class ExpertCache:
     """Per-layer GPU cache of recently used experts, least recently used evicted first.
 
     Consecutive audio frames route mostly to the same experts (72 % repeat from the previous frame in
     a measured run), so most decode steps find their experts here and copy nothing from RAM. The FP8
     kernel reads the cache directly with remapped expert ids: same weights, same kernel.
+
+    Each slot is one byte row holding all four of an expert's tensors (packed_layout), so an expert
+    packed the same way in pinned RAM arrives in one copy instead of four.
     """
     def __init__(self, experts, capacity, device):
         self.capacity = capacity
-        self.gpu = {name: torch.empty((capacity, *getattr(experts, name).shape[1:]), dtype=getattr(experts, name).dtype,
-                                      device=device) for name in FIELDS}
+        layout, size = packed_layout(experts)
+        self.packed = torch.empty((capacity, size), dtype=torch.uint8, device=device)
+        self.gpu = packed_views(self.packed, experts, layout)
+        self.pending = None  # CUDA event of prefetch copies still in flight into this cache
+        self.prefetched = set()  # experts prefetched since the last step of this layer
         self.slots = OrderedDict()  # expert id -> slot, oldest first
         self.free = list(range(capacity - 1, -1, -1))
 
@@ -71,6 +104,9 @@ class ExpertStagingPool:
         self.experts_transferred = 0
         self.cache_hits = 0
         self.cache_misses = 0
+        self.experts_prefetched = 0
+        self.prefetch_used = 0
+        self.prefetch_wasted = 0
         self.shape_signature = None
 
     def stage(self, experts, topk_ids):
@@ -120,28 +156,94 @@ class ExpertStagingPool:
                 self.gpu[name] = torch.empty(shape, dtype=source.dtype, device=self.device)
 
     def _stage_cached(self, experts, cache, ids, unique, inverse):
-        wanted = unique.tolist()
-        missing = [e for e in wanted if e not in cache.slots]
+        slot_of = torch.tensor(self.place(experts, unique.tolist()), dtype=torch.long)
+        remapped = slot_of[inverse].reshape_as(ids).to(self.device, non_blocking=True)
+        return remapped, [cache.gpu[name] for name in FIELDS]
+
+    def place(self, experts, wanted):
+        """Put the distinct experts wanted in the layer's GPU cache; returns their slots, in order.
+
+        Only missing experts are copied, least recently used ones not wanted now are evicted. Kept
+        lean: fast mode calls this at every layer of every step while the GPU waits.
+        """
+        cache = experts.expert_cache
+        if cache.pending is not None:  # prefetch copies may still be writing slots: let them land first
+            torch.cuda.current_stream(cache.packed.device).wait_event(cache.pending)
+            cache.pending = None
+        slots, missing = cache.slots, []
         for e in wanted:
-            if e in cache.slots:
-                cache.slots.move_to_end(e)
-        needed = set(wanted)
-        new_slots = []
-        for e in missing:
-            if cache.free:
-                slot = cache.free.pop()
-            else:  # evict the least recently used expert this step does not need
-                victim = next(k for k in cache.slots if k not in needed)
-                slot = cache.slots.pop(victim)
-            cache.slots[e] = slot
-            new_slots.append(slot)
-        if missing and getattr(experts, 'pinned', False):
+            if e in slots:
+                slots.move_to_end(e)
+            else:
+                missing.append(e)
+        if cache.prefetched:
+            used = len(cache.prefetched.intersection(wanted))
+            self.prefetch_used += used
+            self.prefetch_wasted += len(cache.prefetched) - used
+            cache.prefetched = set()
+        if missing:
+            needed = set(wanted)
+            new_slots = []
+            for e in missing:
+                if cache.free:
+                    slot = cache.free.pop()
+                else:  # evict the least recently used expert this step does not need
+                    slot = slots.pop(next(k for k in slots if k not in needed))
+                slots[e] = slot
+                new_slots.append(slot)
+            self._fill(experts, cache, missing, new_slots)
+        self.calls += 1
+        self.cache_hits += len(wanted) - len(missing)
+        self.cache_misses += len(missing)
+        return [slots[e] for e in wanted]
+
+    def prefetch(self, experts, candidates, limit, stream, after=None):
+        """Copy up to limit of the candidate experts (best first) that the cache lacks, on stream.
+
+        Fast mode guesses the next layer's experts and copies them while the GPU computes, instead of
+        after the router has decided. The copies start after the event after (the current layer's own
+        misses) and land in least recently used slots; place() waits for them before the layer's
+        next use of the cache, so a wrong guess costs bandwidth and a slot, never correctness.
+        """
+        packed = getattr(experts, 'packed', None)
+        cache = experts.expert_cache
+        if packed is None:
+            return
+        picks = []
+        for e in candidates:
+            if e not in cache.slots and e not in picks:
+                picks.append(e)
+                if len(picks) == limit:
+                    break
+        if not picks:
+            return
+        if after is not None:
+            stream.wait_event(after)
+        slots = cache.slots
+        with torch.cuda.stream(stream):
+            for e in picks:
+                slot = cache.free.pop() if cache.free else slots.pop(next(iter(slots)))
+                slots[e] = slot
+                cache.packed[slot].copy_(packed[e], non_blocking=True)
+            cache.pending = torch.cuda.Event()
+            cache.pending.record(stream)
+        cache.prefetched.update(picks)
+        self.experts_prefetched += len(picks)
+        self.bytes_transferred += len(picks) * packed[0].numel()
+
+    def _fill(self, experts, cache, missing, new_slots):
+        """Copy experts missing into cache slots new_slots."""
+        if getattr(experts, 'pinned', False):
+            packed = getattr(experts, 'packed', None)
             for e, slot in zip(missing, new_slots):
-                for name in FIELDS:
-                    cache.gpu[name][slot].copy_(getattr(experts, name)[e], non_blocking=True)
+                if packed is not None:  # same layout as the cache row: one copy
+                    cache.packed[slot].copy_(packed[e], non_blocking=True)
+                else:
+                    for name in FIELDS:
+                        cache.gpu[name][slot].copy_(getattr(experts, name)[e], non_blocking=True)
             self.bytes_transferred += len(missing) * sum(getattr(experts, n)[0].numel() * getattr(experts, n).element_size() for n in FIELDS)
             self.experts_transferred += len(missing)
-        elif missing:
+        else:
             count = len(missing)
             self._ensure(experts, count)
             miss = torch.tensor(missing, dtype=torch.long)
@@ -154,12 +256,6 @@ class ExpertStagingPool:
                 _rows(cache.gpu[name]).index_copy_(0, slots, _rows(gpu))
                 self.bytes_transferred += gpu.numel() * gpu.element_size()
             self.experts_transferred += count
-        self.calls += 1
-        self.cache_hits += len(wanted) - len(missing)
-        self.cache_misses += len(missing)
-        slot_of = torch.tensor([cache.slots[e] for e in wanted], dtype=torch.long)
-        remapped = slot_of[inverse].reshape_as(ids).to(self.device, non_blocking=True)
-        return remapped, [cache.gpu[name] for name in FIELDS]
 
     def stats(self):
         return {
@@ -169,6 +265,9 @@ class ExpertStagingPool:
             "staging_capacity_experts": self.capacity,
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
+            "experts_prefetched": self.experts_prefetched,
+            "prefetch_used": self.prefetch_used,
+            "prefetch_wasted": self.prefetch_wasted,
         }
 
 
@@ -193,6 +292,9 @@ def pin_offloaded_experts(layers, headroom_gib=PIN_HEADROOM_GIB):
     The experts are already in RAM, so pinning swaps a pageable copy for a pinned one: the total does
     not grow, but each layer briefly exists twice. A layer is pinned only when that transient copy
     fits with headroom to spare; the rest keep the pageable path. Returns how many were pinned.
+
+    A pinned layer is packed: one buffer with one byte row per expert (packed_layout), and the four
+    expert tensors become views of it, so the GPU cache receives each expert in one copy.
     """
     import psutil
     pinned = 0
@@ -203,9 +305,13 @@ def pin_offloaded_experts(layers, headroom_gib=PIN_HEADROOM_GIB):
         size = module_bytes(experts)
         if psutil.virtual_memory().available - size < headroom_gib * 2**30:
             break
+        layout, row = packed_layout(experts)
+        packed = torch.empty((experts.num_experts, row), dtype=torch.uint8, pin_memory=True)
+        views = packed_views(packed, experts, layout)
         for name in FIELDS:
-            tensor = getattr(experts, name)
-            tensor.data = tensor.data.pin_memory()
+            views[name].copy_(getattr(experts, name))
+            setattr(experts, name, views[name])  # the pageable original is freed here
+        experts.packed = packed
         experts.pinned = True
         pinned += 1
     return pinned

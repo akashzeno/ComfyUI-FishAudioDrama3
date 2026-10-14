@@ -32,6 +32,14 @@ from fish_speech.models.text2semantic.fish_omni.tower import RAS_WINDOW_FRAMES
 from fp8_offload import FIELDS, OffloadedFP8Experts
 
 
+# Fast mode copies up to 2 experts per layer before the router has picked them: the next layer's
+# router, applied early to this layer's state, finds 53% of the real picks. Replaying 1,947 recorded
+# frames, 2 per layer modelled 14% faster decoding; 3 or more lost time, the wrong guesses crowding
+# the real copies off PCIe.
+PREFETCH_PER_LAYER = 2
+PREFETCH_CANDIDATES = 16
+
+
 def capture_graph(run, pool, stream):
     """Warm run() up on a side stream, then capture it into a CUDA graph.
 
@@ -138,6 +146,9 @@ class BackboneGraphs:
     attention and router of the next streamed layer. Between pieces the CPU fetches that layer's
     experts into its GPU cache. With every layer streamed, a step is 41 graph launches instead of
     about 6,800 kernel launches.
+
+    Each piece also runs the following layer's router early, on the state it has; its best guesses
+    not in the cache are copied on a side stream while the next piece computes (prefetch).
     """
 
     def __init__(self, backbone, buckets, pool, stream):
@@ -161,8 +172,19 @@ class BackboneGraphs:
         self.residual = torch.zeros((1, 1, hidden), dtype=backbone.residual_dtype, device=device)
         self.routed = torch.zeros((1, hidden), dtype=backbone.dtype, device=device)
         self.weights = torch.zeros((1, top_k), dtype=backbone.dtype, device=device)
-        self.ids = torch.zeros((1, top_k), dtype=torch.long, device=device)
+        # Layers whose next layer is prefetched: streamed, and packed for one-copy experts.
+        self.guess = {i: self.layers[i + 1] for i in self.stops
+                      if i + 1 in self.stops and getattr(self.layers[i + 1].mlp.experts, 'packed', None) is not None}
+        self.top_k = top_k
+        # The router's picks, then the early guesses for the next layer: one copy back per stop.
+        self.picks = torch.zeros((1, top_k + PREFETCH_CANDIDATES), dtype=torch.long, device=device)
+        self.ids = self.picks[:, :top_k]
         self.slots = torch.zeros((1, top_k), dtype=torch.long, device=device)
+        self.picks_host = torch.zeros(self.picks.shape, dtype=torch.long, pin_memory=True)
+        self.slots_host = torch.zeros((1, top_k), dtype=torch.long, pin_memory=True)
+        self.picks_array, self.slots_array = self.picks_host.numpy(), self.slots_host.numpy()
+        self.prefetch_stream = torch.cuda.Stream(device)
+        self.misses_queued = torch.cuda.Event()
         self.output = torch.zeros((1, 1, hidden), dtype=backbone.dtype, device=device)
         self.graphs = {}
         for piece in range(len(self.stops) + 1):
@@ -213,14 +235,15 @@ class BackboneGraphs:
         for index in self.piece_layers(piece):
             layer = self.layers[index]
             if piece < len(self.stops) and index == self.stops[piece]:
-                self.attend_and_route(layer, x, context)
+                self.attend_and_route(index, x, context)
                 return
             x = layer(x, context)
         norm = self.backbone.model.norm
         self.output.copy_(norm(x).to(self.backbone.dtype))
 
-    def attend_and_route(self, layer, x, context):
+    def attend_and_route(self, index, x, context):
         """DecoderLayer.forward up to the router (SparseMoeBlock.forward's first half)."""
+        layer = self.layers[index]
         compute_dtype = layer.input_layernorm.weight.dtype
         mixer = layer.self_attn if layer.layer_type == 'full_attention' else layer.linear_attn
         x = x + mixer(layer.input_layernorm(x).to(compute_dtype), context)
@@ -234,6 +257,10 @@ class BackboneGraphs:
         self.routed.copy_(flat)
         self.weights.copy_(weights.to(flat.dtype))
         self.ids.copy_(ids)
+        following = self.guess.get(index)
+        if following is not None:  # the next layer's router, early, on this layer's state
+            early = following.post_attention_layernorm(x).to(compute_dtype).reshape(-1, x.shape[-1])
+            self.picks[:, self.top_k:].copy_(following.mlp.gate(early).topk(PREFETCH_CANDIDATES, dim=-1).indices)
 
     def finish_experts(self, layer):
         """The rest of the layer: the fetched experts from the cache, the shared expert, the residual."""
@@ -243,11 +270,20 @@ class BackboneGraphs:
         shared_gate = torch.sigmoid(moe.shared_expert_gate(self.routed))
         return self.residual + (out + shared_gate * moe.shared_expert(self.routed)).view_as(self.residual)
 
-    def fetch(self, layer):
-        """Read the router's picks, copy missing experts into the cache, point the kernel at their slots."""
-        experts = layer.mlp.experts
-        slots, _ = experts.staging_pool.stage(experts, self.ids)
-        self.slots.copy_(slots)
+    def fetch(self, index):
+        """Read the router's picks, copy missing experts into the cache, point the kernel at their slots.
+
+        Returns the next layer's guessed experts, best first, when that layer is prefetched.
+        """
+        experts = self.layers[index].mlp.experts
+        self.picks_host.copy_(self.picks)  # waits for the piece that ran this layer's router
+        picks = self.picks_array[0].tolist()
+        # top-k picks are distinct. The host buffers are rewritten only after the next piece has
+        # run, and with it the slot copy queued here.
+        self.slots_array[0] = experts.staging_pool.place(experts, picks[:self.top_k])
+        self.slots.copy_(self.slots_host, non_blocking=True)
+        self.misses_queued.record()
+        return picks[self.top_k:] if index in self.guess else None
 
     def step(self, embeddings, position):
         """The backbone at position for input embeddings [1, 1, H]; returns the final-norm hidden [1, 1, H].
@@ -258,9 +294,12 @@ class BackboneGraphs:
         self.embeddings.copy_(embeddings)
         self.position.fill_(position)
         for piece in range(len(self.stops) + 1):
-            if piece:
-                self.fetch(self.layers[self.stops[piece - 1]])
+            guesses = self.fetch(self.stops[piece - 1]) if piece else None
             self.graphs[piece, kv_len if self.attends(piece) else None].replay()
+            if guesses:  # copy the next layer's likely experts while this piece computes
+                following = self.guess[self.stops[piece - 1]].mlp.experts
+                following.staging_pool.prefetch(following, guesses, PREFETCH_PER_LAYER, self.prefetch_stream,
+                                                after=self.misses_queued)
         return self.output
 
 

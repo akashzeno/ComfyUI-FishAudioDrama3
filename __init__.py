@@ -98,7 +98,7 @@ class Drama3FP8Speech:
             'streaming': ('BOOLEAN', {'default': False, 'tooltip': 'Decode and preview during generation. Uses more RAM offloading and may run slower.'}),
             'keep_loaded': ('BOOLEAN', {'default': True, 'tooltip': 'Keep the model loaded between runs (saves about 1.5 min per run). It is unloaded after idle_unload_minutes, or as soon as ComfyUI loads another model onto the GPU.'}),
             'idle_unload_minutes': ('INT', {'default': 10, 'min': 1, 'max': 240, 'tooltip': 'Unload the kept model after this many minutes without a run.'}),
-            'fast_mode': ('BOOLEAN', {'default': True, 'tooltip': 'Replay each decoding step from CUDA graphs and read the prompt in larger chunks: about 5x faster. Takes repeat exactly, but differ slightly from takes made with this off; off reproduces the original integration bit for bit.'}),
+            'fast_mode': ('BOOLEAN', {'default': True, 'tooltip': 'Replay each decoding step from CUDA graphs and read the prompt in larger chunks: about 6x faster. Takes repeat exactly, but differ slightly from takes made with this off; off reproduces the original integration bit for bit.'}),
         }, 'hidden': {'unique_id': 'UNIQUE_ID'}}
 
     RETURN_TYPES = ('AUDIO', 'DRAMA3_TAKE', 'STRING')
