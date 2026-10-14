@@ -1,175 +1,171 @@
-# Drama 3 for ComfyUI
+# ComfyUI-FishAudioDrama3
 
-![Drama 3 for ComfyUI](assets/banner.svg)
+Run **[Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3)** — the 35B mixture-of-experts
+text-to-speech model that takes stage directions — locally in ComfyUI, with the **original FP8
+weights**, on a **16 GB GPU**.
 
-Run [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) locally in ComfyUI with **the original FP8 weights**. Selected routed experts are staged from system RAM so the released checkpoint can run on a **32 GB RTX 5090**. No INT8 conversion, retraining, or speech API is involved.
+**Built with Fish Audio.** Unofficial integration; not affiliated with Fish Audio.
 
-**Unofficial integration. Built with Fish Audio.** Experimental Windows implementation, validated with ComfyUI 0.39.0 and frontend 1.55.17.
+- **Runs in ComfyUI's own Python.** No second environment and nothing pip-installed: a setup script
+  fetches Fish Speech's inference code at a pinned commit and checks the GPU kernels before you
+  download anything.
+- **Fits a 16 GB card.** About 7 GB of the model stays on the GPU; the routed experts (28 GB) stream
+  from system RAM as each step needs them. Same weights, same maths — nothing is re-quantised.
+- **Keeps the model loaded between runs.** The first run of a session loads it (about 1.5 min);
+  later runs start generating at once. It hands the GPU back on its own the moment ComfyUI loads any
+  other model, after an idle period, or when you press *Free memory*.
+- **Shows its work.** The node's progress bar moves through loading and generation, and the model's
+  own log — its frame counter included — appears in ComfyUI's terminal.
+- **The whole of Drama 3:** voice cloning from a clip and its transcript, natural-language
+  directions, inline sounds and word tags, up to 16 speakers per script, long scripts, several
+  seeds per run, previous-take context, and live preview.
 
-## This fork (ComfyUI-FishAudioDrama3): run with ComfyUI's own Python
+## Requirements
 
-Fork of [Nebuluss/Drama-3](https://github.com/Nebuluss/Drama-3). Instead of building a separate
-Python 3.12 environment, jobs run in a **separate process started with ComfyUI's own
-interpreter** — the same environment, nothing pip-installed.
+| | |
+|---|---|
+| GPU | NVIDIA with FP8 tensor cores (RTX 40 or 50 series, SM 8.9+). Tested: RTX 5080 16 GB |
+| System RAM | 64 GB (the experts live there, pinned) |
+| Disk | about 45 GB: 41.5 GB of weights plus Fish Speech's code |
+| ComfyUI | a current build with Triton (tested: ComfyUI 0.39, torch 2.14.1, Triton 3.8, Windows) |
+| Other | `git` on PATH |
 
-**The model stays loaded between runs** (`keep_loaded`, on by default). Loading the codec and the
-41.5 GB model takes about 1.5 minutes; a persistent worker pays that once and runs each later job
-with the model in memory. It gives the ~13 GB of VRAM and the pinned RAM back after
-`idle_unload_minutes` (default 10), when ComfyUI exits, and **as soon as ComfyUI is about to load
-any other model onto the GPU** (the node wraps `load_models_gpu` and `unload_all_models`, so the
-*Free memory* button releases it too). Measured on an RTX 5080: a 7.4 s line took 87 s with the
-model loaded against 203 s loading it per job, with the same output — the reused model produced a
-bit-identical take. Turn `keep_loaded` off for the original one-process-per-job behaviour.
-
-The worker encodes each distinct reference clip once and reuses the codes. That matters: the very
-first codec encode in a process takes slightly different floating-point paths than every later one
-(equally accurate — the same reconstruction error — but different codes, so different takes). A
-one-job process always encodes its reference first; the worker does the same for the first
-reference it meets and then reuses those codes, so its takes match the one-job mode bit for bit.
-
-The node's progress bar moves through loading and generation, and the job's own log (Fish Speech's
-frame counter included) is echoed to ComfyUI's terminal.
-
-Everything Drama 3 imports was already present in the tested ComfyUI environment (torch 2.14.1,
-Triton 3.8.0). The one missing package, `natsort`, is used only by a Fish Speech file-listing
-helper; the runner substitutes `sorted` when it is absent.
+## Install
 
 ```powershell
-# from this folder, with ComfyUI's Python
-python setup_comfyenv.py --checkpoint-dir D:\Models\drama-3              # Fish Speech + self-check
-python setup_comfyenv.py --checkpoint-dir D:\Models\drama-3 --download   # + the 41.5 GB checkpoint
+cd ComfyUI\custom_nodes
+git clone https://github.com/akashzeno/ComfyUI-FishAudioDrama3.git
+cd ComfyUI-FishAudioDrama3
+
+# with ComfyUI's Python:
+python setup_comfyenv.py --checkpoint-dir ..\..\models\TTS\drama-3              # code + self-check
+python setup_comfyenv.py --checkpoint-dir ..\..\models\TTS\drama-3 --download   # + the weights
 ```
 
-`setup_comfyenv.py` fetches Fish Speech at the same pinned commit as `install.ps1` into `local/`
-(git-ignored), applies `runtime/streaming.patch`, writes `local/model-location.json`, and runs
-`runtime/selfcheck.py`: every import a job needs, then Fish's FP8 MoE kernels on the GPU against
-the same maths in fp32 (pass: cosine > 0.995 — the RTX 5080 scores 0.999). Run it before
-downloading the weights.
+1. **The first command** fetches Fish Speech at the pinned commit into `local/` (git-ignored),
+   applies a small streaming patch, records where the weights go, and runs a **self-check**: it
+   imports everything a job needs, then runs Fish's FP8 kernels on your GPU against the same maths
+   in full precision. If that fails, your setup can't run Drama 3 — and you have not downloaded
+   41.5 GB to find out.
+2. **The second** downloads the checkpoint at the pinned revision (it resumes if interrupted).
+   You can also download the files yourself — `codec.pth`, the eight `model-0000N-of-00008.safetensors`
+   and the small `*.json` files, from the pinned revision — and rerun the first command.
+3. **Restart ComfyUI.** The nodes are under **audio → Drama 3**.
 
-Leave the node's `runtime_folder` blank for comfyenv mode. A folder made by `install.ps1`
-(recognised by its `drama3-env`) still runs upstream's isolated environment. Tested on an RTX 5080
-16 GB with 64 GB RAM, which upstream has not validated.
-
-## Listen to the examples
-
-**[▶ Open the audio gallery — play directly in your browser](https://nebuluss.github.io/Drama-3/)**
-
-| Example | Listen |
-|---|---|
-| French voice cloning | [▶ Français](https://nebuluss.github.io/Drama-3/#fr) |
-| Spanish from a French reference | [▶ Español](https://nebuluss.github.io/Drama-3/#es) |
-| Italian from a French reference | [▶ Italiano](https://nebuluss.github.io/Drama-3/#it) |
-| Two recorded reference voices | [▶ French dialogue: Quenard / Tranié references](https://nebuluss.github.io/Drama-3/#duo) |
-| Delivery cues | [▶ Warm](https://nebuluss.github.io/Drama-3/#warm) · [▶ Angry](https://nebuluss.github.io/Drama-3/#angry) · [▶ Sad](https://nebuluss.github.io/Drama-3/#sad) · [▶ Whisper](https://nebuluss.github.io/Drama-3/#whisper) |
-
-All examples are **AI-generated speech**. The gallery has audio players and WAV downloads. [Texts, settings and measurements](examples/README.md).
-
-## What you can do
-
-| Capability | How |
-|---|---|
-| Text to speech and multilingual scripts | Write the text in the desired language |
-| Voice cloning | Connect reference audio and its exact transcript |
-| Multiple voice references | Voice Reference → Voice Bank → Speech; speaker IDs 0–15 |
-| Dialogue | Use `<\|speaker:0\|>`, `<\|speaker:1\|>`, etc. with `chunk_mode=speakers` to generate each turn from its own references |
-| Emotion and delivery | Natural-language `[cues]`, `direction`, `<whisper>` and `<emphasis>` |
-| Long scripts | Sentence-aware automatic chunking, or one part per line |
-| Early-stop workaround at commas | `chunk_mode=clauses` queues each clause separately |
-| Variations | Generate several seeds while loading the model once |
-| Continue or redirect a take | Feed the `take` output into `previous_take` |
-| Reuse a voice bank | Save/load compact `.npz` takes containing encoded references |
-| Listen during generation | Enable `streaming`, then click **Enable live listening** |
-| Replace an audio section | Included manual trim → regenerate → concatenate workflow |
-
-The local public code supports previous audio as conversation context. **Precise word-only inpainting is not implemented here**; redirection generates a new take, and section replacement is a manual edit. See the [official announcement](https://fish.audio/blog/fish-audio-drama-3/) for the separate editing product.
-
-## Installation — Windows / NVIDIA
-
-Requirements: Git, [uv](https://docs.astral.sh/uv/getting-started/installation/), a recent NVIDIA driver, and a current ComfyUI with the dynamic-input API. Hardware validation used a 32 GB RTX 5090 and 128 GB system RAM. Plan for substantial system RAM and at least 60 GB of free storage for the checkpoint, runtime and caches; 64 GB RAM is a reasonable starting point, but only the 128 GB machine has been tested.
-
-From your ComfyUI folder:
-
-```powershell
-git clone https://github.com/Nebuluss/Drama-3.git custom_nodes/ComfyUI-Drama3-FP8
-cd custom_nodes/ComfyUI-Drama3-FP8
-powershell -ExecutionPolicy Bypass -File install.ps1 -RuntimeDir "D:\Models\Drama3Runtime" -CheckpointDir "D:\Models\drama-3"
-```
-
-The installer creates an **isolated Python 3.12 runtime**, installs PyTorch 2.8 / CUDA 12.9 and Triton Windows, fetches a pinned Fish Speech revision, applies the small streaming patch, and downloads the pinned checkpoint directly to the chosen drive. It does not install packages into ComfyUI's Python. Caches and the managed Python download also stay in the selected directories.
-
-Already have this exact checkpoint, including `revision.txt`? Add `-SkipDownload`. Another drive is fine; pass explicit directories. The installer stores the runtime location in the local, ignored `runtime.json`. You can also set `DRAMA3_RUNTIME`, or override `runtime_folder` in the Speech node.
-
-Copy `examples/Drama3_demo_*` into `ComfyUI/input`, then restart ComfyUI. Open **Templates → ComfyUI-Drama3-FP8**, or drag one of the [workflow JSON files](workflows) onto the canvas. The example source clips are synthetic.
-
-## Workflows
-
-| Workflow | Purpose |
-|---|---|
-| [Basic speech](workflows/Drama3-FP8-Workflow.json) | Quick start |
-| [Voice cloning](workflows/Drama3-Voice-Cloning-Workflow.json) | One reference and exact transcript |
-| [Voice cloning with Whisper](workflows/Drama3-Whisper-Voice-Cloning.json) | Automatically transcribe the reference with comfy_mtb, then feed it to Drama 3 |
-| [Multiple voices](workflows/Drama3-Multi-Voice-Dialogue.json) | Two references and a speaker-tagged conversation |
-| [French cloning](workflows/Drama3-French-Cloning.json) | French speech from a reference voice |
-| [Spanish cloning](workflows/Drama3-Spanish-Cloning.json) | Spanish speech from a reference voice |
-| [Italian cloning](workflows/Drama3-Italian-Cloning.json) | Italian speech from a reference voice |
-| [Expressive / multilingual](workflows/Drama3-Expressive-Multilingual.json) | Delivery cues and paired tags |
-| [Long text](workflows/Drama3-Long-Text.json) | Automatic or line-based chunks |
-| [Comma-safe clauses](workflows/Drama3-Comma-Safe.json) | Keep later clauses queued after an early stop |
-| [Variations](workflows/Drama3-Variations.json) | Three seeds in one job |
-| [Continuation](workflows/Drama3-Continuation.json) | Use the previous generated take as context |
-| [Redirection](workflows/Drama3-Redirection.json) | Regenerate with a different delivery instruction |
-| [Continue existing audio](workflows/Drama3-Continue-Existing-Audio.json) | Encode an existing recording as previous context |
-| [Load a saved take](workflows/Drama3-Load-Saved-Take.json) | Reuse encoded references and conversation history |
-| [Progressive preview](workflows/Drama3-Progressive-Preview.json) | Play decoded blocks before generation finishes |
-| [Replace a section](workflows/Drama3-Replace-Audio-Section.json) | Manual timeline replacement |
-
-Every workflow contains a short usage note. The two default reference clips are related synthetic voices, so they demonstrate routing and conditioning rather than a strong contrast between speakers. Replace them with two distinct voice samples for your own dialogue.
-
-## Voice references and delivery
+## Quick start: clone a voice and direct it
 
 ```text
-<|speaker:0|> [warm, cheerful] Hello, welcome back.
-<|speaker:1|> [angry] You are late again!
-<|speaker:0|> [sad, disappointed] I am sorry about that.
-<|speaker:1|> <whisper>It is fine. Come inside.</whisper>
+Load Audio (your voice clip) ──→ Drama 3 - FP8 Speech (RAM Offload) ──→ Save Audio
+                                   reference_audio + reference_text
 ```
 
-For each Voice Reference, provide the clip's **actual words** and its speaker ID. Connect the references to Voice Bank; its inputs grow as you add voices. Multiple clips may share a speaker ID. The model's 0–15 speaker tags are distinct from the number of reference clips.
+- **`reference_audio`** — a clean clip of one speaker, 3–30 s.
+- **`reference_text`** — exactly what is said in that clip. A wrong transcript weakens the clone.
+- **`text`** — the line to speak, with its direction:
 
-The optional **Whisper cloning workflow** requires [comfy_mtb](https://github.com/melMass/comfy_mtb) and a full Whisper `large` checkpoint in `ComfyUI/models/whisper/whisper-large`. It uses **Load Whisper (mtb) → Audio To Text (mtb)**. The same Load Audio output feeds both transcription and `reference_audio`; the transcription's first `STRING` output feeds `reference_text`. Keep your new speech in `text`. To wire this manually, right-click the Speech node and choose **Convert Widget to Input → reference_text**. The preset uses French (`fr`), no timestamps and `download_missing=False`; select the language and installed model you need. WanVideoWrapper's Whisper Model Loader supplies encoder features rather than a transcript and cannot replace this pair.
+```text
+[warm and relaxed, like talking to an old friend] It's been a while. [small laugh] Too long, honestly.
+```
 
-After updating the extension, **restart the ComfyUI process**, then reload the workflow. Refreshing the browser does not load updated Python nodes. If `max_frames=0` is rejected or an empty runtime path resolves to the ComfyUI directory, an older node is still loaded. The installer configures the runtime in `runtime.json`; `runtime_folder` can override it. Whisper connections were checked against the installed node schemas; its dependency is optional for other Drama 3 workflows.
+`workflows/` has ready-made graphs: cloning, multi-voice dialogue, long text, variations,
+continuation, redirection, progressive preview and more. Their demo voices are in `examples/`.
 
-`direction` applies a delivery cue to each generated part. Cues guide the model; they do not guarantee a particular emotion, accent, speaker identity, or word-perfect reading.
+## Writing the text
 
-## Settings that matter
+| Tool | Write | What it does |
+|---|---|---|
+| Direction | `[slow, dangerously quiet]` before the words | Brief it like an actor: emotion, intent, pace, who is being addressed. It holds until the next direction, so a second one changes the mood mid-line |
+| Sound or pause | `[pause]` `[small laugh]` `[laughs]` `[sigh]` `[shaky breath]` | Placed exactly where it happens, and nowhere else |
+| Word tags | `<emphasis>…</emphasis>` `<stress>` `<soft>` `<slow>` `<fast>` `<forceful>` `<whisper>` | Change only the words they wrap |
+| Speakers | `<\|speaker:0\|>` … `<\|speaker:15\|>` | Several voices in one script; give each a reference (Voice Reference → Voice Bank) |
+| Pronunciation | `<\|phoneme_start\|>N IY1 L<\|phoneme_end\|>` | CMU Arpabet, for names it gets wrong |
 
-- **max_frames** limits each part, not the whole script. `0` selects 600 frames per part for a multi-part script, or 2048 for one part. 256 frames is about 12 seconds. A `length` finish reason means the cap was reached; raise it if speech is truncated.
-- **chunk_mode**: `auto` uses the upstream sentence-aware splitter; `single` keeps the whole prompt; `lines` also breaks at newlines; `clauses` also separates commas and punctuation while protecting cues, paired tags and decimals. Separate clauses can introduce more audible pauses and seams. This workaround cannot prevent omissions within a clause.
-  Start monologues with `auto` and `chunk_bytes=300`. `clauses` is an early-stop workaround, not the default for fluent delivery: it can generate many very short parts. The Whisper cloning preset uses `auto`.
-- **Dialogue**: `chunk_mode=speakers` queues every speaker-tagged turn separately, using only the matching reference clips and no previous conversation audio. The parts are concatenated; the model is loaded once. This avoids losing later turns when a whole-dialogue request stops early. A speaker without a matching reference uses unconditioned TTS. `single` remains available, but EOS alone does not prove the entire script was spoken.
-- **history_turns** retains recent parts in addition to the first. Old history is pruned to fit the upstream prompt limit. `use_history=False` reuses a saved take's reference bank while starting fresh.
-- **variations** increments the seed and returns separate audio/take outputs. Save Audio writes each variation separately. More variations take proportionally more generation time.
-- **streaming** decodes blocks of 64 frames, about 3 seconds of speech. Loading and prefill still happen first. It is progressive playback, **not guaranteed real-time playback**: you may wait between blocks. Decoder windows retain 128 frames of context to bound memory; long streams can differ slightly from decoding the entire utterance at once.
-  Set `streaming=True` **before Run**, then click **Enable live listening** to allow playback. That button controls the player only; it does not enable streaming or change a queued job. With `streaming=False`, the final audio is available after generation and the live player receives no audio blocks.
-- **release_comfy_models** frees ComfyUI's loaded models before speech by default. Each job exits its isolated process afterward, returning the VRAM to ComfyUI. The speech model reloads for the next job.
+What we learned the hard way:
 
-Avoid simultaneous speech jobs or other GPU-heavy applications. The node chooses its weight budget from free VRAM, but another process allocating memory afterward can still cause an out-of-memory error. Cancel in ComfyUI to stop the isolated child process.
+- **Avoid em dashes and ellipses** next to sounds. `— [small laugh]` produced a 7.6 s stretch of
+  silence in one take; commas and full stops give natural pauses.
+- **Put the direction in `text` and set `chunk_mode` to `single`** for short directed lines. In
+  `auto` mode, text over `chunk_bytes` is split into parts, and only the first part carries the
+  direction you wrote at its start.
+- **Set `max_frames`.** Occasionally a take never ends. 480 frames is about 22 s; the default (0)
+  allows 2,048 frames — 95 s of audio and many minutes of waiting.
+- **Generate a few seeds.** Takes vary; `variations` = 3 gives seeds `seed`, `seed+1`, `seed+2` in one run.
 
-Save Take writes to `ComfyUI/output`; copy the `.npz` file into `ComfyUI/input` before selecting it in Load Take. Takes contain transcripts, integer VQ codes and encoded references, not model weights. Loading uses NumPy with pickle disabled.
+## The speech node's settings
 
-## Examples and validation
+| Input | Default | Notes |
+|---|---|---|
+| `text` | — | What to say, with directions and tags |
+| `seed` / `variations` | 42 / 1 | Takes use consecutive seeds |
+| `max_frames` | 0 (auto) | A cap per part; ~21.5 frames per second of audio |
+| `temperature` / `top_p` / `top_k` | 0.7 / 0.7 / 30 | Lower temperature gives steadier, flatter reads |
+| `direction` | empty | A direction added in front of every part — use it *or* write the direction in `text` |
+| `chunk_mode` | auto | `single` keeps the text in one part; `speakers`, `lines` and `clauses` split it |
+| `previous_take` | — | Continue from an earlier take or recording |
+| `streaming` | off | Decode and play blocks while generating (uses more VRAM) |
+| `keep_loaded` | on | Keep the model loaded between runs |
+| `idle_unload_minutes` | 10 | Unload the kept model after this long without a run |
+| `release_comfy_models` | on | Unload ComfyUI's models before loading Drama 3 |
+| `runtime_folder` | blank | Blank: ComfyUI's Python. A folder made by `install.ps1`: that isolated environment |
 
-[Listen to the generated examples and read their settings](examples/README.md). These are local synthetic-voice demonstrations, not a voice-cloning quality benchmark.
+## How it works
 
-Actual ComfyUI API validation covered two references, speaker IDs, four delivery instructions, two variation seeds, multi-part context, progressive WebSocket events, saving/loading takes, reference override, and French/Spanish/Italian clause-by-clause generation. The dialogue and multilingual parts ended naturally with EOS. A separate longer streaming test reached its 256-frame cap; it verified preview blocks at 64, 128, 192 and 256 frames and is recorded as a capped stress test. The original FP8 expert staging also passed a bit-for-bit comparison against resident FP8 experts on the 5090.
+- **A separate process.** Drama 3 runs in a child process started with ComfyUI's own interpreter,
+  so a 35B model that runs out of memory cannot take ComfyUI down with it. With `keep_loaded` that
+  process stays alive and takes jobs one after another; otherwise it exits after each job.
+- **Experts from RAM.** The attention layers, shared layers and as many expert layers as fit in your
+  VRAM stay on the GPU. For the rest, each step copies only the 8 experts (of 256) the router picks,
+  from pinned RAM, in their original FP8 form.
+- **Giving the GPU back.** ComfyUI can't see memory used by another process, so the node wraps
+  `load_models_gpu` and `unload_all_models`: before any other model loads onto the GPU, the Drama 3
+  process is asked to exit.
+- **Same output as a fresh process.** The first audio-codec encode in any process takes slightly
+  different floating-point paths than every later one. The kept-loaded process encodes each reference
+  once and reuses those codes, so its takes match a fresh process bit for bit (checked on an RTX 5080).
 
-Detailed measurements and the longer streaming test are included with the examples. Timings are specific to this machine and these scripts; loading, prompt length, reference length, RAM bandwidth and other GPU use affect results. The installer was syntax-checked, argument forwarding was checked, and its patch was verified against the pinned upstream source. A second complete installation/download has not been run.
+## Speed (RTX 5080 16 GB, 64 GB RAM, PCIe 4.0 ×8)
 
-## Credits and license
+| | |
+|---|---|
+| Loading codec + model | about 1.5–2 min, once per session with `keep_loaded` |
+| A 7.4 s line, model already loaded | about 105 s |
+| The same line, loading per run | 203 s |
+| Peak memory | about 14 GB VRAM, 30 GB RAM |
 
-- [Fish Audio Drama 3 weights](https://huggingface.co/fishaudio/drama-3), revision `dd64a85cd82e9521f7202610ede97b367fc83946`.
-- [Fish Speech source](https://github.com/fishaudio/fish-speech), commit `1ff3c3ed2f80d3106a83909dd25b83129c3d816f`.
-- [ComfyUI](https://github.com/comfyanonymous/ComfyUI).
+Generation runs about 12× slower than real time on this card because most experts stream from RAM;
+more VRAM keeps more of them resident.
 
-See [LICENSE](LICENSE) and [NOTICE](NOTICE) for the Fish Audio Community License and attribution. Model weights are downloaded from Fish Audio and are not included here. Use references you have the right to use; the upstream license includes consent and misuse restrictions.
+## Troubleshooting
+
+- **"Drama 3 is not set up"** — run `setup_comfyenv.py` (see Install).
+- **"Free other GPU workloads"** — the job needs about 11 GB free on the GPU. Close other GPU apps.
+- **Slow, or the PC swaps** — the model pins about 28 GB of RAM; close heavy apps (browsers, editors).
+- **A take keeps going** — set `max_frames`, and stop the run from ComfyUI; the process is killed.
+- **Check the install** — `python setup_comfyenv.py` reruns the self-check at any time.
+
+## Tests
+
+```powershell
+python tests\test_runtime_paths.py
+python tests\test_worker_protocol.py
+python tests\test_worker_manager.py
+python tests\test_log_echo.py
+# these import the runner, so they need the Fish Speech checkout:
+$env:DRAMA3_STATE = "$PWD\local"; $env:PYTHONPATH = "$PWD\runtime"
+python tests\test_progress.py
+python tests\test_speaker_dialogue.py
+```
+
+## Credits and licence
+
+- **[Nebuluss/Drama-3](https://github.com/Nebuluss/Drama-3)** — the original ComfyUI integration
+  this project is built on: the RAM expert staging, the speech, voice and take nodes, the workflows
+  and the examples. Its isolated-environment installer (`install.ps1`) still works here.
+- **[Fish Audio](https://fish.audio)** — [Drama 3](https://huggingface.co/fishaudio/drama-3) and
+  [Fish Speech](https://github.com/fishaudio/fish-speech).
+
+The Fish Audio Materials are licensed under the **Fish Audio Community License, Version 1.0** — see
+`LICENSE`, and `NOTICE` for the attribution and the list of changes. In short: research and
+non-commercial use are free; commercial use is free while your annual revenue is under US$500,000;
+running it as a hosted speech service for others needs a separate licence from Fish Audio; and you
+may not imitate a real person's voice without their consent. Model weights are not included here.
