@@ -40,6 +40,7 @@ from fish_speech.models.dac.inference import load_model as load_codec
 from fish_speech.models.dac.modded_dac import WindowLimitedTransformer
 from fish_speech.models.text2semantic.fish_omni.chunking import Drama3History, PROTECTED_SPAN, parse_speaker_segments, split_drama3_text
 from fish_speech.models.text2semantic.fish_omni.generate import Drama3PromptTooLongError, build_drama3_prompt, generate_drama3
+from drama3_generate import TowerDecodeGraphs, generate_drama3_graphed
 
 
 FRAMES_PER_SECOND = 44100 / 2048  # Drama 3 codec: 44.1 kHz audio, 2048 samples per frame
@@ -193,7 +194,9 @@ def load_state(budget):
     # reference it meets is encoded exactly as a one-job process would, and every later job with
     # that reference reuses those codes. Its takes then match the one-job mode bit for bit.
     model = load_offloaded_model(checkpoint, gpu_budget_gib=budget - CODEC_RESERVE_GIB)
-    return {'checkpoint': checkpoint, 'revision': revision, 'codec': codec, 'model': model, 'references': {}}
+    graphs = TowerDecodeGraphs.build(model)  # before any seed: capturing runs the sampler
+    return {'checkpoint': checkpoint, 'revision': revision, 'codec': codec, 'model': model, 'references': {},
+            'graphs': graphs}
 
 
 def run_job(job, output, budget, state=None):
@@ -237,10 +240,12 @@ def run_job(job, output, budget, state=None):
     encoded = time.perf_counter()
     if state:
         model = state['model']
+        graphs = state.get('graphs')
         pool_before = model.offload_pool.stats()
     else:
         emit(stage='Loading original FP8 model (most of it into RAM)', progress=.06)
         model = load_offloaded_model(checkpoint, gpu_budget_gib=budget - (CODEC_RESERVE_GIB if streaming else 0))
+        graphs = TowerDecodeGraphs.build(model)  # before any seed: capturing runs the sampler
         pool_before = {}
     loaded = time.perf_counter()
     text = job['text']
@@ -297,9 +302,13 @@ def run_job(job, output, budget, state=None):
                      progress=generation_progress(variation, variants, index, len(chunks), len(frames), estimate))
 
             limit = job.get('max_frames', 0) or (600 if len(chunks) > 1 else 2048)
-            frames, finish = generate_drama3(model, prompt, max_new_tokens=limit, prefill_chunk_size=32,
-                temperature=job.get('temperature', .7), top_p=job.get('top_p', .7), top_k=job.get('top_k', 30),
-                frame_callback=preview if streaming else report, stream_interval=64 if streaming else 16)
+            sampling = dict(max_new_tokens=limit, prefill_chunk_size=32, temperature=job.get('temperature', .7),
+                            top_p=job.get('top_p', .7), top_k=job.get('top_k', 30),
+                            frame_callback=preview if streaming else report, stream_interval=64 if streaming else 16)
+            if graphs is not None and len(prompt) + limit <= graphs.capacity:
+                frames, finish = generate_drama3_graphed(model, prompt, graphs=graphs, **sampling)
+            else:
+                frames, finish = generate_drama3(model, prompt, **sampling)
             if not len(frames):
                 raise RuntimeError(f'No audio frames produced for part {index+1}.')
             codes = frames[:, 1:].T.contiguous().numpy().astype(np.int16)

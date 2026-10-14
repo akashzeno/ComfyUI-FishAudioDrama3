@@ -98,6 +98,7 @@ class Drama3FP8Speech:
             'streaming': ('BOOLEAN', {'default': False, 'tooltip': 'Decode and preview during generation. Uses more RAM offloading and may run slower.'}),
             'keep_loaded': ('BOOLEAN', {'default': True, 'tooltip': 'Keep the model loaded between runs (saves about 1.5 min per run). It is unloaded after idle_unload_minutes, or as soon as ComfyUI loads another model onto the GPU.'}),
             'idle_unload_minutes': ('INT', {'default': 10, 'min': 1, 'max': 240, 'tooltip': 'Unload the kept model after this many minutes without a run.'}),
+            'cuda_graphs': ('BOOLEAN', {'default': True, 'tooltip': 'Replay each decoding step from CUDA graphs instead of launching thousands of small GPU kernels: much faster. Takes are repeatable but not bit-identical to takes made with this off (same seed, slightly different numerics).'}),
         }, 'hidden': {'unique_id': 'UNIQUE_ID'}}
 
     RETURN_TYPES = ('AUDIO', 'DRAMA3_TAKE', 'STRING')
@@ -111,7 +112,7 @@ class Drama3FP8Speech:
                    reference_audio=None, reference_text='', temperature=.7, top_p=.7, top_k=30,
                    voices=None, previous_take=None, direction='', chunk_mode='auto', chunk_bytes=300,
                    history_turns=1, use_history=True, variations=1, streaming=False, keep_loaded=True,
-                   idle_unload_minutes=10, unique_id=None):
+                   idle_unload_minutes=10, cuda_graphs=True, unique_id=None):
         if not text.strip():
             raise ValueError('Enter some text to speak.')
         if reference_audio is not None and not reference_text.strip():
@@ -125,8 +126,9 @@ class Drama3FP8Speech:
             if missing:
                 raise RuntimeError(f'Drama 3 is not set up in {runtime} (missing {", ".join(missing)}). '
                                    f'Run: python "{NODE_DIR / "setup_comfyenv.py"}" --checkpoint-dir <folder>')
+        launch['env'] = {**launch['env'], 'DRAMA3_CUDA_GRAPHS': '1' if cuda_graphs else '0'}
         persistent = keep_loaded and launch['mode'] == 'comfyenv'
-        key = (str(python), str(runner), str(runtime))
+        key = (str(python), str(runner), str(runtime), cuda_graphs)
         reuse = persistent and WORKER.matches(key)
         if reuse:
             budget = WORKER.budget

@@ -109,6 +109,7 @@ What we learned the hard way:
 | `streaming` | off | Decode and play blocks while generating (uses more VRAM) |
 | `keep_loaded` | on | Keep the model loaded between runs |
 | `idle_unload_minutes` | 10 | Unload the kept model after this long without a run |
+| `cuda_graphs` | on | Replay decoding steps from CUDA graphs (faster). Takes repeat exactly, but differ slightly from takes made with it off |
 | `release_comfy_models` | on | Unload ComfyUI's models before loading Drama 3 |
 | `runtime_folder` | blank | Blank: ComfyUI's Python. A folder made by `install.ps1`: that isolated environment |
 
@@ -134,6 +135,11 @@ What we learned the hard way:
 - **Giving the GPU back.** ComfyUI can't see memory used by another process, so the node wraps
   `load_models_gpu` and `unload_all_models`: before any other model loads onto the GPU, the Drama 3
   process is asked to exit.
+- **CUDA graphs for the audio decoder.** Each audio frame runs the audio decoder (the "tower"):
+  about 1,000 small GPU kernels. They are captured once as CUDA graphs and replayed as one launch.
+  This is Fish Speech's own graph code path — attention over padded cache lengths, sampling settings
+  held on the GPU — so the same seed gives the same take every time, but not the exact take that
+  `cuda_graphs` off gives. Switch it off to reproduce older takes.
 - **Same output as a fresh process.** The first audio-codec encode in any process takes slightly
   different floating-point paths than every later one. The kept-loaded process encodes each reference
   once and reuses those codes, so its takes match a fresh process bit for bit (checked on an RTX 5080).
@@ -143,15 +149,17 @@ What we learned the hard way:
 | | |
 |---|---|
 | Loading codec + model (and locking the experts in RAM) | about 2 min, once per session with `keep_loaded` |
-| A 7.4 s line, model already loaded | about 70 s (generation 65–75 s) |
+| Generation per audio frame (~21.5 frames per second of audio) | 0.30 s with `cuda_graphs`, 0.44 s without |
+| A 7.4 s line, model already loaded, `cuda_graphs` off | about 70 s (generation 65–75 s) |
 | The same line in the original integration, loading per run | 203 s (generation 92 s) |
-| Peak memory | about 11.7 GB VRAM, 31 GB RAM (30 GB of it pinned experts) |
+| Peak memory | about 12.4 GB VRAM (11.7 without `cuda_graphs`), 31 GB RAM (30 GB of it pinned experts) |
 
-Every speed-up above was checked to give **bit-identical audio** to the original integration on the
-same seed. What remains is mostly kernel-launch overhead: each step stops at every layer to learn
-which experts to fetch, so the CPU cannot queue GPU work ahead (about 6,800 small kernel launches per
-audio frame). CUDA graphs would remove most of it but cannot span those stops; that is the next
-step.
+Every speed-up except `cuda_graphs` was checked to give **bit-identical audio** to the original
+integration on the same seed; `cuda_graphs` takes were checked for repeatability, words and voice.
+
+What remains is the backbone's kernel-launch overhead. Each step stops at every layer to learn which
+experts to fetch, so the CPU cannot queue GPU work ahead, and one CUDA graph cannot span those stops.
+Capturing the pieces between the stops is the next step.
 
 ## Troubleshooting
 
