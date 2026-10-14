@@ -12,7 +12,7 @@ weights**, on a **16 GB GPU**.
 - **Fits a 16 GB card.** About 7 GB of the model stays on the GPU; the routed experts (30 GB) are
   locked in system RAM and only the ones each step picks are copied over, with the most recently
   used kept in a GPU cache. Same weights, same maths — nothing is re-quantised.
-- **Keeps the model loaded between runs.** The first run of a session loads it (about 1.5 min);
+- **Keeps the model loaded between runs.** The first run of a session loads it (about 2 min);
   later runs start generating at once. It hands the GPU back on its own the moment ComfyUI loads any
   other model, after an idle period, or when you press *Free memory*.
 - **Shows its work.** The node's progress bar moves through loading and generation, and the model's
@@ -142,7 +142,7 @@ What we learned the hard way:
 
 | | |
 |---|---|
-| Loading codec + model | about 1.5–2 min, once per session with `keep_loaded` |
+| Loading codec + model (and locking the experts in RAM) | about 2 min, once per session with `keep_loaded` |
 | A 7.4 s line, model already loaded | about 70 s (generation 65–75 s) |
 | The same line in the original integration, loading per run | 203 s (generation 92 s) |
 | Peak memory | about 11.7 GB VRAM, 31 GB RAM (30 GB of it pinned experts) |
@@ -170,11 +170,16 @@ python tests\test_runtime_paths.py
 python tests\test_worker_protocol.py
 python tests\test_worker_manager.py
 python tests\test_log_echo.py
+python tests\test_checkpoint_verify.py
 # these import the runner, so they need the Fish Speech checkout:
 $env:DRAMA3_STATE = "$PWD\local"; $env:PYTHONPATH = "$PWD\runtime"
 python tests\test_progress.py
 python tests\test_speaker_dialogue.py
+python tests\test_expert_cache.py
 ```
+
+The speed work is also checked end to end on the GPU: the same request and seed must give
+bit-identical audio before and after each change.
 
 ## Credits and licence
 
