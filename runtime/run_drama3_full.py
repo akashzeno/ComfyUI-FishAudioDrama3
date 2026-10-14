@@ -9,15 +9,23 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-(ROOT / 'tmp').mkdir(exist_ok=True)
-os.environ['TEMP'] = os.environ['TMP'] = str(ROOT / 'tmp')
-os.environ['TRITON_CACHE_DIR'] = str(ROOT / 'triton-cache')
+# comfyenv mode keeps this runner in the repo and its state (Fish Speech checkout, model location,
+# caches) in DRAMA3_STATE; the upstream isolated runtime keeps everything beside the runner.
+STATE = Path(os.environ.get('DRAMA3_STATE') or ROOT)
+(STATE / 'tmp').mkdir(parents=True, exist_ok=True)
+os.environ['TEMP'] = os.environ['TMP'] = str(STATE / 'tmp')
+os.environ['TRITON_CACHE_DIR'] = str(STATE / 'triton-cache')
 os.environ['FISH_DRAMA3_CUDA_GRAPH'] = '0'
 os.environ['HF_HUB_OFFLINE'] = '1'
 compiler = Path(sys.prefix) / 'Lib/site-packages/triton/runtime/tcc/tcc.exe'
 if compiler.exists():
     os.environ['CC'] = str(compiler)
-sys.path.insert(0, str(ROOT / 'fish-speech'))
+sys.path.insert(0, str(STATE / 'fish-speech'))
+try:
+    import natsort  # noqa: F401  (Fish Speech imports it; only its file-listing helper uses it)
+except ImportError:
+    import types
+    sys.modules['natsort'] = types.SimpleNamespace(natsorted=sorted)
 
 import numpy as np
 import psutil
@@ -108,7 +116,7 @@ def build_speaker_prompt(chunk, tokenizer, config, voices):
 def run_job(job, output, budget):
     output.parent.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
-    checkpoint = Path(json.loads((ROOT / 'model-location.json').read_text(encoding='utf-8-sig'))['checkpoint_dir'])
+    checkpoint = Path(json.loads((STATE / 'model-location.json').read_text(encoding='utf-8-sig'))['checkpoint_dir'])
     revision = (checkpoint / 'revision.txt').read_text().strip()
     events = output.parent / 'events.jsonl'
     events.write_text('', encoding='utf-8')
@@ -250,7 +258,7 @@ def main():
     parser.add_argument('--temperature', type=float, default=.7)
     parser.add_argument('--top-p', type=float, default=.7)
     parser.add_argument('--top-k', type=int, default=30)
-    parser.add_argument('--output', type=Path, default=ROOT.parent/'outputs/drama3-fp8-test.wav')
+    parser.add_argument('--output', type=Path, default=STATE.parent/'outputs/drama3-fp8-test.wav')
     args = parser.parse_args()
     job = json.loads(args.request.read_text(encoding='utf-8')) if args.request else {
         'text': args.text, 'seed': args.seed, 'max_frames': args.max_frames, 'temperature': args.temperature,
