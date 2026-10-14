@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -17,10 +18,11 @@ from comfy.utils import ProgressBar
 from comfy_api.latest import io
 from server import PromptServer
 from .take_io import load_take, save_take
+from .runtime_paths import resolve_launch
 
-CONFIG = Path(__file__).resolve().parent / 'runtime.json'
-DEFAULT_RUNTIME = Path(os.environ.get('DRAMA3_RUNTIME') or
-    (json.loads(CONFIG.read_text(encoding='utf-8-sig'))['runtime_folder'] if CONFIG.is_file() else r'D:\Models\Drama3Runtime'))
+NODE_DIR = Path(__file__).resolve().parent
+CONFIG = NODE_DIR / 'runtime.json'
+CONFIG_FOLDER = json.loads(CONFIG.read_text(encoding='utf-8-sig'))['runtime_folder'] if CONFIG.is_file() else ''
 VOICE = io.Custom('DRAMA3_VOICE')
 VOICES = io.Custom('DRAMA3_VOICES')
 
@@ -43,7 +45,7 @@ class Drama3FP8Speech:
             'seed': ('INT', {'default': 42, 'min': 0, 'max': 0xffffffffffffffff}),
             'max_frames': ('INT', {'default': 0, 'min': 0, 'max': 16384, 'step': 32,
                 'tooltip': 'Per part: 0 = automatic (600 frames for long scripts, 2048 for a single part). 256 frames is about 12 seconds.'}),
-            'runtime_folder': ('STRING', {'default': '', 'tooltip': 'Leave blank to use the installed runtime configuration.'}),
+            'runtime_folder': ('STRING', {'default': '', 'tooltip': 'Leave blank to run with ComfyUI\'s own Python (state in this node\'s local/ folder). A folder made by install.ps1 runs its isolated environment instead.'}),
             'release_comfy_models': ('BOOLEAN', {'default': True}),
         }, 'optional': {
             'reference_audio': ('AUDIO',),
@@ -80,11 +82,13 @@ class Drama3FP8Speech:
             raise ValueError('Enter the exact reference transcript in reference_text.')
         if reference_audio is None and reference_text.strip():
             raise ValueError('Connect reference_audio, or clear reference_text.')
-        runtime = Path(runtime_folder.strip()).expanduser().resolve() if runtime_folder.strip() else DEFAULT_RUNTIME.resolve()
-        python = runtime / 'drama3-env/Scripts/python.exe'
-        runner = runtime / 'run_drama3_full.py'
-        if not python.is_file() or not runner.is_file():
-            raise RuntimeError(f'The complete Drama 3 runtime is missing from {runtime}.')
+        launch = resolve_launch(NODE_DIR, runtime_folder, env=os.environ, executable=sys.executable, config_folder=CONFIG_FOLDER)
+        python, runner, runtime = launch['python'], launch['runner'], launch['cwd']
+        if launch['mode'] == 'comfyenv':
+            missing = [name for name in ('fish-speech', 'model-location.json') if not (runtime / name).exists()]
+            if missing:
+                raise RuntimeError(f'Drama 3 is not set up in {runtime} (missing {", ".join(missing)}). '
+                                   f'Run: python "{NODE_DIR / "setup_comfyenv.py"}" --checkpoint-dir <folder>')
         if release_comfy_models:
             model_management.unload_all_models()
             model_management.soft_empty_cache()
@@ -156,7 +160,8 @@ class Drama3FP8Speech:
                         notify(event)
 
             with log_path.open('w', encoding='utf-8') as log:
-                process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, creationflags=flags, cwd=str(runtime))
+                process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, creationflags=flags, cwd=str(runtime),
+                                           env=os.environ | launch['env'])
                 try:
                     while process.poll() is None:
                         model_management.throw_exception_if_processing_interrupted()
