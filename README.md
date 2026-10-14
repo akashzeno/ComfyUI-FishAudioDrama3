@@ -9,8 +9,9 @@ weights**, on a **16 GB GPU**.
 - **Runs in ComfyUI's own Python.** No second environment and nothing pip-installed: a setup script
   fetches Fish Speech's inference code at a pinned commit and checks the GPU kernels before you
   download anything.
-- **Fits a 16 GB card.** About 7 GB of the model stays on the GPU; the routed experts (28 GB) stream
-  from system RAM as each step needs them. Same weights, same maths — nothing is re-quantised.
+- **Fits a 16 GB card.** About 7 GB of the model stays on the GPU; the routed experts (30 GB) are
+  locked in system RAM and only the ones each step picks are copied over, with the most recently
+  used kept in a GPU cache. Same weights, same maths — nothing is re-quantised.
 - **Keeps the model loaded between runs.** The first run of a session loads it (about 1.5 min);
   later runs start generating at once. It hands the GPU back on its own the moment ComfyUI loads any
   other model, after an idle period, or when you press *Free memory*.
@@ -116,9 +117,20 @@ What we learned the hard way:
 - **A separate process.** Drama 3 runs in a child process started with ComfyUI's own interpreter,
   so a 35B model that runs out of memory cannot take ComfyUI down with it. With `keep_loaded` that
   process stays alive and takes jobs one after another; otherwise it exits after each job.
-- **Experts from RAM.** The attention layers, shared layers and as many expert layers as fit in your
-  VRAM stay on the GPU. For the rest, each step copies only the 8 experts (of 256) the router picks,
-  from pinned RAM, in their original FP8 form.
+- **Experts from RAM.** The attention layers and shared layers stay on the GPU. The routed experts
+  live in RAM, and each step needs only the 8 (of 256) the router picks in each layer:
+  - **Locked (pinned) RAM.** Ordinary RAM gets trimmed when memory runs low, and copies then stall on
+    page faults (measured: about 1 GB/s). Pinned RAM stays resident, and the GPU copies each expert
+    straight from it at full PCIe speed (13 GB/s on PCIe 4.0 ×8) with no CPU copy in between. Layers
+    are pinned only while there is room for the brief second copy; the rest use the old path.
+  - **A GPU cache of recent experts** in each layer (20 per layer on a 16 GB card, least recently used
+    evicted). Speech reuses experts from frame to frame, so a share of each step copies nothing. The
+    kernel reads the cache directly; weights and maths are unchanged.
+  - Leftover VRAM goes to the cache rather than to whole resident layers: a slot serves all 40
+    layers, a resident layer only one. If the whole model fits, nothing streams at all.
+- **A lighter codec.** The audio codec builds three 32,768 × 32,768 attention masks (3 GB) that its
+  windowed transformers never read — they always build their own mask. They are dropped at load,
+  which takes the codec from 4.6 GB to 1.6 GB of VRAM.
 - **Giving the GPU back.** ComfyUI can't see memory used by another process, so the node wraps
   `load_models_gpu` and `unload_all_models`: before any other model loads onto the GPU, the Drama 3
   process is asked to exit.
@@ -131,19 +143,23 @@ What we learned the hard way:
 | | |
 |---|---|
 | Loading codec + model | about 1.5–2 min, once per session with `keep_loaded` |
-| A 7.4 s line, model already loaded | about 105 s |
-| The same line, loading per run | 203 s |
-| Peak memory | about 14 GB VRAM, 30 GB RAM |
+| A 7.4 s line, model already loaded | about 70 s (generation 65–75 s) |
+| The same line in the original integration, loading per run | 203 s (generation 92 s) |
+| Peak memory | about 11.7 GB VRAM, 31 GB RAM (30 GB of it pinned experts) |
 
-Generation runs about 12× slower than real time on this card because most experts stream from RAM;
-more VRAM keeps more of them resident.
+Every speed-up above was checked to give **bit-identical audio** to the original integration on the
+same seed. What remains is mostly kernel-launch overhead: each step stops at every layer to learn
+which experts to fetch, so the CPU cannot queue GPU work ahead (about 6,800 small kernel launches per
+audio frame). CUDA graphs would remove most of it but cannot span those stops; that is the next
+step.
 
 ## Troubleshooting
 
 - **"Drama 3 is not set up"** — run `setup_comfyenv.py` (see Install).
 - **"Free other GPU workloads"** — the job needs about 14 GB of free VRAM with `keep_loaded` (the codec
   stays loaded beside the model), about 10.5 GB without. Close other GPU apps.
-- **Slow, or the PC swaps** — the model pins about 28 GB of RAM; close heavy apps (browsers, editors).
+- **Slow, or the PC swaps** — the model locks about 30 GB of RAM while loaded; close heavy apps
+  (browsers, editors). If RAM is short at load, some layers stay unpinned and run slower.
 - **A take keeps going** — set `max_frames`, and stop the run from ComfyUI; the process is killed.
 - **Check the install** — `python setup_comfyenv.py` reruns the self-check at any time.
 
