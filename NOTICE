@@ -12,3 +12,12 @@ original FP8 routed experts from system RAM without converting checkpoint weight
 ComfyUI nodes, job orchestration, workflows and documentation were added.
 Model weights are not distributed in this repository.
 The example voices are synthetic model outputs, not recordings of real people.
+
+Changes in ComfyUI-FishAudioDrama3 (fork of https://github.com/Nebuluss/Drama-3 by Nebuluss):
+jobs run with ComfyUI's own Python instead of a separate environment (setup_comfyenv.py,
+runtime_paths.py; Fish Speech is fetched at the same pinned commit and patched with the same
+runtime/streaming.patch); a persistent worker keeps the model loaded between jobs and releases
+the GPU when ComfyUI loads another model (worker_manager.py, runtime/worker_protocol.py,
+run_drama3_full.py --serve); generation progress and the job log are reported to ComfyUI
+(log_echo.py); an FP8 kernel self-check (runtime/selfcheck.py). The Fish Audio Materials
+themselves are not modified beyond upstream's runtime/streaming.patch.

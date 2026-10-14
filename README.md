@@ -6,12 +6,29 @@ Run [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) locally in Co
 
 **Unofficial integration. Built with Fish Audio.** Experimental Windows implementation, validated with ComfyUI 0.39.0 and frontend 1.55.17.
 
-## This fork: run with ComfyUI's own Python (comfyenv mode)
+## This fork (ComfyUI-FishAudioDrama3): run with ComfyUI's own Python
 
 Fork of [Nebuluss/Drama-3](https://github.com/Nebuluss/Drama-3). Instead of building a separate
-Python 3.12 environment, each job runs in a **separate process started with ComfyUI's own
-interpreter** — the same environment, nothing pip-installed. The process still exits after every
-job, so the ~12 GB of VRAM and the pinned RAM it uses go back to ComfyUI.
+Python 3.12 environment, jobs run in a **separate process started with ComfyUI's own
+interpreter** — the same environment, nothing pip-installed.
+
+**The model stays loaded between runs** (`keep_loaded`, on by default). Loading the codec and the
+41.5 GB model takes about 1.5 minutes; a persistent worker pays that once and runs each later job
+with the model in memory. It gives the ~13 GB of VRAM and the pinned RAM back after
+`idle_unload_minutes` (default 10), when ComfyUI exits, and **as soon as ComfyUI is about to load
+any other model onto the GPU** (the node wraps `load_models_gpu` and `unload_all_models`, so the
+*Free memory* button releases it too). Measured on an RTX 5080: a 7.4 s line took 87 s with the
+model loaded against 203 s loading it per job, with the same output — the reused model produced a
+bit-identical take. Turn `keep_loaded` off for the original one-process-per-job behaviour.
+
+The worker encodes each distinct reference clip once and reuses the codes. That matters: the very
+first codec encode in a process takes slightly different floating-point paths than every later one
+(equally accurate — the same reconstruction error — but different codes, so different takes). A
+one-job process always encodes its reference first; the worker does the same for the first
+reference it meets and then reuses those codes, so its takes match the one-job mode bit for bit.
+
+The node's progress bar moves through loading and generation, and the job's own log (Fish Speech's
+frame counter included) is echoed to ComfyUI's terminal.
 
 Everything Drama 3 imports was already present in the tested ComfyUI environment (torch 2.14.1,
 Triton 3.8.0). The one missing package, `natsort`, is used only by a Fish Speech file-listing
